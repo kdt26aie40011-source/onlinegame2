@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>うろドロ</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <!-- 入室 -->
+  <main id="join-screen" class="center-screen">
+    <h1 class="logo">うろドロ</h1>
+    <form id="join-form" class="card join-card">
+      <label for="name-input">名前（9文字まで）</label>
+      <input id="name-input" type="text" maxlength="9" autocomplete="nickname" required>
+      <button class="btn btn-primary" type="submit">入室する</button>
+      <p id="join-error" class="error" hidden></p>
+    </form>
+  </main>
+
+  <!-- 入室できない・切断 -->
+  <main id="error-screen" class="center-screen" hidden>
+    <h1 class="logo">うろドロ</h1>
+    <p id="error-message" class="card"></p>
+    <a class="btn" href="/">トップへ戻る</a>
+  </main>
+
+  <!-- ゲーム -->
+  <div id="game-screen" class="game" hidden>
+    <header class="game-header">
+      <span class="logo logo-small">うろドロ</span>
+      <span id="round-info" class="round-info"></span>
+      <span id="timer" class="timer" hidden></span>
+    </header>
+
+    <aside class="players">
+      <h2>プレイヤー</h2>
+      <ul id="player-list"></ul>
+    </aside>
+
+    <main class="stage">
+      <p id="notice" class="notice" hidden></p>
+
+      <section id="phase-lobby" class="phase" hidden>
+        <h2>ロビー</h2>
+        <div class="card">
+          <label for="room-url">この部屋のURL（友達に送ってください）</label>
+          <div class="row">
+            <input id="room-url" type="text" readonly>
+            <button id="copy-url" class="btn" type="button">コピー</button>
+          </div>
+        </div>
+        <button id="start-game" class="btn btn-primary btn-large" hidden>ゲーム開始</button>
+        <p id="lobby-wait" class="hint"></p>
+      </section>
+
+      <section id="phase-topic" class="phase" hidden>
+        <form id="topic-form" class="card" hidden>
+          <h2>あなたは親です</h2>
+          <label for="topic-input">お題を入力してください</label>
+          <div class="row">
+            <input id="topic-input" type="text" autocomplete="off">
+            <button class="btn btn-primary" type="submit">決定</button>
+          </div>
+          <p class="hint">時間切れになると、お題がランダムで決まります。</p>
+        </form>
+        <p id="topic-wait" class="big-message" hidden></p>
+      </section>
+
+      <section id="phase-draw" class="phase" hidden>
+        <p class="topic-banner">お題：<strong id="draw-topic"></strong></p>
+        <p id="draw-topic-auto" class="hint" hidden>親が時間内に決めなかったので、お題はランダムで決まりました。</p>
+        <div id="draw-board" hidden>
+          <div class="toolbar">
+            <div id="color-palette" class="palette"></div>
+            <div id="width-picker" class="widths"></div>
+            <button id="tool-eraser" class="btn btn-small" type="button">消しゴム</button>
+            <button id="tool-undo" class="btn btn-small" type="button">戻す</button>
+            <button id="tool-clear" class="btn btn-small" type="button">全消し</button>
+          </div>
+          <canvas id="canvas" width="600" height="600"></canvas>
+          <button id="submit-drawing" class="btn btn-primary btn-large" type="button">完成！</button>
+        </div>
+        <p id="draw-wait" class="big-message" hidden></p>
+      </section>
+
+      <section id="phase-select" class="phase" hidden>
+        <p class="topic-banner">お題：<strong id="select-topic"></strong></p>
+        <p id="select-info" class="big-message"></p>
+        <div id="select-gallery" class="gallery"></div>
+      </section>
+
+      <section id="phase-result" class="phase" hidden>
+        <p class="topic-banner">お題：<strong id="result-topic"></strong></p>
+        <p id="result-message" class="big-message"></p>
+        <div id="result-gallery" class="gallery"></div>
+        <button id="next-round" class="btn btn-primary btn-large" hidden>次へ進む</button>
+        <p id="result-wait" class="hint"></p>
+      </section>
+    </main>
+  </div>
+
+  <!-- 絵の拡大表示 -->
+  <div id="zoom" class="zoom" hidden>
+    <figure>
+      <img id="zoom-image" alt="拡大した絵">
+      <figcaption id="zoom-caption"></figcaption>
+    </figure>
+    <div class="row zoom-actions">
+      <button id="zoom-select" class="btn btn-primary" type="button" hidden>この絵を1位にする</button>
+      <button id="zoom-close" class="btn" type="button">閉じる</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/drawing-board.js"></script>
+  <script src="/js/room.js"></script>
+</body>
+</html>
