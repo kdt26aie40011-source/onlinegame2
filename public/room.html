@@ -8,7 +8,7 @@
 </head>
 <body>
   <!-- 入室 -->
-  <main id="join-screen" class="center-screen">
+  <main id="join-screen" class="center-screen" hidden>
     <h1 class="logo">うろドロ</h1>
     <form id="join-form" class="card join-card">
       <label for="name-input">名前（9文字まで）</label>
@@ -18,6 +18,16 @@
       <button id="join-button" class="btn btn-primary" type="submit">入室する</button>
       <p id="join-error" class="error" hidden></p>
     </form>
+  </main>
+
+  <!-- 自分で退出した -->
+  <main id="left-screen" class="center-screen" hidden>
+    <h1 class="logo">うろドロ</h1>
+    <p class="card">退出しました。<br>2分以内なら、同じ席（成績もそのまま）に戻れます。</p>
+    <div class="row">
+      <button id="return-room" class="btn btn-primary" type="button">部屋に戻る</button>
+      <a class="btn" href="/">トップへ</a>
+    </div>
   </main>
 
   <!-- 入室できない・切断 -->
@@ -33,7 +43,12 @@
       <span class="logo logo-small">うろドロ</span>
       <span id="round-info" class="round-info"></span>
       <span id="timer" class="timer" hidden></span>
+      <div class="header-actions">
+        <button id="close-room" class="btn btn-small btn-danger" type="button" hidden>部屋を終了</button>
+        <button id="leave-room" class="btn btn-small" type="button">退出</button>
+      </div>
     </header>
+    <p id="connection-banner" class="connection-banner" hidden>接続が切れました。再接続しています…</p>
 
     <aside class="players">
       <h2>プレイヤー</h2>
@@ -125,6 +140,17 @@
     <div class="row zoom-actions">
       <button id="zoom-select" class="btn btn-primary" type="button" hidden>この絵を1位にする</button>
       <button id="zoom-close" class="btn" type="button">閉じる</button>
+    </div>
+  </div>
+
+  <!-- 確認ダイアログ -->
+  <div id="confirm" class="zoom" role="dialog" aria-modal="true" aria-labelledby="confirm-message" hidden>
+    <div class="card confirm-card">
+      <p id="confirm-message"></p>
+      <div class="row confirm-actions">
+        <button id="confirm-cancel" class="btn" type="button">やめる</button>
+        <button id="confirm-ok" class="btn btn-primary" type="button">OK</button>
+      </div>
     </div>
   </div>
 

@@ -46,17 +46,23 @@ io.on('connection', (socket) => {
 
   const currentRoom = () => rooms.get(socket.data.roomId);
 
-  on('join', ({ roomId, name, icon }, reply) => {
-    if (socket.data.roomId) return reply({ ok: false, error: 'すでに入室しています' });
-    const room = rooms.get(roomId);
-    if (!room) return reply({ ok: false, error: '部屋が見つかりません' });
-    const result = room.join(socket, name, icon);
-    if (!result.ok) return reply(result);
-    socket.data.roomId = room.id;
-    socket.data.playerId = result.playerId;
-    reply(result);
-    room.broadcast();
-  });
+  // 新しく入室する（join）か、2分以内に同じ席へ戻る（rejoin）
+  const enter = (event, run) => {
+    on(event, (payload, reply) => {
+      if (socket.data.roomId) return reply({ ok: false, error: 'すでに入室しています' });
+      const room = rooms.get(payload.roomId);
+      if (!room) return reply({ ok: false, error: '部屋が見つかりません' });
+      const result = run(room, payload);
+      if (!result.ok) return reply(result);
+      socket.data.roomId = room.id;
+      socket.data.playerId = result.playerId;
+      reply(result);
+      room.broadcast();
+    });
+  };
+
+  enter('join', (room, { name, icon }) => room.join(socket, name, icon));
+  enter('rejoin', (room, { playerId, token }) => room.rejoin(socket, playerId, token));
 
   // 以下はすべて「入室済みのプレイヤー」からの操作
   const action = (event, run) => {
@@ -74,10 +80,18 @@ io.on('connection', (socket) => {
   action('drawing:submit', (room, pid, { image }) => room.submitDrawing(pid, image));
   action('winner:select', (room, pid, { drawingId }) => room.selectWinner(pid, drawingId));
   action('drawing:like', (room, pid, { drawingId }) => room.like(pid, drawingId));
+  action('host:transfer', (room, pid, { playerId }) => room.transferHost(pid, playerId));
+  action('room:close', (room, pid) => room.forceClose(pid));
+  action('room:leave', (room, pid) => {
+    socket.data.roomId = null;
+    socket.leave(room.id);
+    room.disconnect(pid);
+    return { ok: true };
+  });
 
   socket.on('disconnect', () => {
     const room = currentRoom();
-    if (room) room.leave(socket.data.playerId);
+    if (room) room.disconnect(socket.data.playerId);
   });
 });
 

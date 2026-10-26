@@ -154,6 +154,7 @@ select:disabled { background: #f7f2ea; color: var(--text); opacity: 1; }
 .game-header {
   grid-area: header;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 1em;
   padding: 0.6em 16px;
@@ -163,9 +164,8 @@ select:disabled { background: #f7f2ea; color: var(--text); opacity: 1; }
   top: 0;
   z-index: 10;
 }
-.round-info { color: var(--muted); font-weight: bold; }
+.round-info { flex: 1; color: var(--muted); font-weight: bold; }
 .timer {
-  margin-left: auto;
   padding: 0.2em 0.9em;
   border-radius: 999px;
   background: var(--accent);
@@ -202,6 +202,33 @@ select:disabled { background: #f7f2ea; color: var(--text); opacity: 1; }
 .badge-parent { background: var(--primary); color: #fff; }
 .badge-me { background: var(--accent); }
 .badge-wait { background: #e6e6e6; color: var(--muted); }
+.badge-away { background: #d9d9d9; color: #555; }
+.players li.away .player-icon, .players li.away .player-name { opacity: 0.4; }
+.btn-give { margin-left: auto; padding: 0.1em 0.6em; font-size: 0.75rem; }
+
+.btn-danger { color: var(--danger); border-color: #f1b7b7; }
+.btn-danger:hover { background: #fdeaea; }
+
+.header-actions { display: flex; gap: 0.4em; }
+
+.connection-banner {
+  position: fixed;
+  top: calc(8px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 150;
+  margin: 0;
+  padding: 0.5em 1.2em;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-weight: bold;
+  max-width: calc(100% - 32px);
+}
+
+.confirm-card { width: min(100%, 360px); text-align: center; }
+.confirm-card p { white-space: pre-line; font-weight: bold; margin: 0 0 1em; }
+.confirm-actions { justify-content: center; }
 
 .stage {
   grid-area: stage;

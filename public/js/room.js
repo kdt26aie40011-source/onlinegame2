@@ -5,7 +5,6 @@ const socket = io();
 
 let state = null;
 let deadline = null; // この端末の時計での締め切り
-let joined = false;
 let boardRoundKey = null;
 let submitting = false;
 let galleryKey = null;
@@ -20,24 +19,71 @@ const board = new DrawingBoard($('canvas'), {
   clearButton: $('tool-clear'),
 });
 
-// ---- 入室 ----
+// ---- 入室・復帰 ----
 
 const ROOM_NOT_FOUND = '部屋が見つかりません。URLを確認するか、新しく部屋を作ってください。';
+const SEAT_KEY = `urodoro.seat.${roomId}`;
 let selectedIcon = null;
+let inRoom = false; // 席に着いている（切断したら自動で復帰を試みる）
+
+const emitAsync = (event, payload = {}) => new Promise((resolve) => socket.emit(event, payload, resolve));
 
 $('name-input').value = safeStorage('get', 'urodoro.name') || '';
-loadRoomInfo();
+init();
+
+async function init() {
+  const info = await loadRoomInfo();
+  if (!info) return;
+
+  // 2分以内に戻ってきた場合は、名前を入れ直さずに同じ席へ戻る
+  const seat = loadSeat();
+  if (seat) {
+    const res = await emitAsync('rejoin', { roomId, ...seat });
+    if (res.ok) return enterRoom();
+    clearSeat();
+    showJoinError('前回の席は解放されました。もう一度入室してください');
+  }
+  renderIconPicker(info.icons);
+  if (info.full) showJoinError('部屋が満員です');
+  $('join-screen').hidden = false;
+}
 
 async function loadRoomInfo() {
   try {
     const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`);
-    if (res.status === 404) return showError(ROOM_NOT_FOUND);
-    const info = await res.json();
-    renderIconPicker(info.icons);
-    if (info.full) showJoinError('部屋が満員です');
+    if (res.status === 404) {
+      clearSeat();
+      showError(ROOM_NOT_FOUND);
+      return null;
+    }
+    return await res.json();
   } catch {
-    showJoinError('部屋の情報を読み込めませんでした。再読み込みしてください');
+    showError('部屋の情報を読み込めませんでした。再読み込みしてください。');
+    return null;
   }
+}
+
+function loadSeat() {
+  try {
+    const seat = JSON.parse(safeStorage('get', SEAT_KEY));
+    return seat && typeof seat.playerId === 'string' && typeof seat.token === 'string' ? seat : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearSeat() {
+  try {
+    localStorage.removeItem(SEAT_KEY);
+  } catch {
+    // 保存できない環境では何もしない
+  }
+}
+
+function enterRoom() {
+  inRoom = true;
+  for (const id of ['join-screen', 'left-screen', 'error-screen', 'connection-banner']) $(id).hidden = true;
+  $('game-screen').hidden = false;
 }
 
 function renderIconPicker(icons) {
@@ -84,37 +130,104 @@ $('join-form').addEventListener('submit', (e) => {
       if (res.error === '部屋が見つかりません') return showError(ROOM_NOT_FOUND);
       return showJoinError(res.error);
     }
-    joined = true;
     safeStorage('set', 'urodoro.name', name);
     safeStorage('set', 'urodoro.icon', selectedIcon);
-    // 復帰時の本人確認用（ステップ3で使う）
-    safeStorage('set', 'urodoro.playerId', res.playerId);
-    $('join-screen').hidden = true;
-    $('game-screen').hidden = false;
+    // 復帰時の本人確認に使う
+    safeStorage('set', SEAT_KEY, JSON.stringify({ playerId: res.playerId, token: res.token }));
+    enterRoom();
   });
 });
 
 socket.on('state', (next) => {
+  if (!inRoom) return;
   state = next;
   deadline = next.remainingMs != null ? Date.now() + next.remainingMs : null;
   render();
 });
 
-socket.on('notify', ({ message }) => showToast(message));
+socket.on('notify', ({ message }) => {
+  if (inRoom) showToast(message);
+});
 
 socket.on('disconnect', () => {
-  if (!joined) return;
-  joined = false;
-  socket.disconnect();
-  showError('接続が切れました。ページを再読み込みすると入り直せます。');
+  if (inRoom) $('connection-banner').hidden = false;
+});
+
+// Socket.IO が自動で再接続したら、同じ席に戻る
+socket.on('connect', async () => {
+  if (!inRoom) return;
+  const seat = loadSeat();
+  const res = seat ? await emitAsync('rejoin', { roomId, ...seat }) : { ok: false };
+  if (res.ok) {
+    $('connection-banner').hidden = true;
+    return;
+  }
+  clearSeat();
+  showError('接続が切れている間に、席が解放されたか部屋が終了しました。');
+});
+
+socket.on('replaced', () => {
+  showError('別のタブや端末でこの部屋に入り直したため、この画面の接続は終了しました。');
+});
+
+socket.on('room:closed', () => {
+  clearSeat();
+  showError('ホストが部屋を終了しました。');
 });
 
 function showError(message) {
-  $('join-screen').hidden = true;
-  $('game-screen').hidden = true;
-  $('zoom').hidden = true;
+  inRoom = false;
+  for (const id of ['join-screen', 'game-screen', 'left-screen', 'zoom', 'confirm', 'connection-banner']) $(id).hidden = true;
   $('error-message').textContent = message;
   $('error-screen').hidden = false;
+}
+
+// ---- 退出・部屋の終了 ----
+
+$('leave-room').addEventListener('click', async () => {
+  if (!(await confirmDialog('退出しますか？\n2分以内なら同じ席に戻れます。'))) return;
+  inRoom = false;
+  await emitAsync('room:leave');
+  $('game-screen').hidden = true;
+  $('zoom').hidden = true;
+  $('left-screen').hidden = false;
+});
+
+$('return-room').addEventListener('click', async () => {
+  const seat = loadSeat();
+  const res = seat ? await emitAsync('rejoin', { roomId, ...seat }) : { ok: false };
+  if (res.ok) return enterRoom();
+  clearSeat();
+  showError('席が解放されたか、部屋が終了しました。');
+});
+
+$('close-room').addEventListener('click', async () => {
+  if (!(await confirmDialog('部屋を終了しますか？\n全員が退出になり、成績も消えます。'))) return;
+  emitAction('room:close');
+});
+
+async function transferHost(player) {
+  if (!(await confirmDialog(`${player.name}さんにホストを譲りますか？`))) return;
+  emitAction('host:transfer', { playerId: player.id });
+}
+
+// 確認ダイアログ（ブラウザ標準の confirm は使わない）
+function confirmDialog(message) {
+  return new Promise((resolve) => {
+    $('confirm-message').textContent = message;
+    $('confirm').hidden = false;
+    $('confirm-ok').focus();
+    const finish = (result) => {
+      $('confirm').hidden = true;
+      $('confirm-ok').removeEventListener('click', onOk);
+      $('confirm-cancel').removeEventListener('click', onCancel);
+      resolve(result);
+    };
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    $('confirm-ok').addEventListener('click', onOk);
+    $('confirm-cancel').addEventListener('click', onCancel);
+  });
 }
 
 // ---- 描画 ----
@@ -133,6 +246,7 @@ function render() {
   const g = s.game;
 
   renderPlayers();
+  $('close-room').hidden = !isHost();
   $('round-info').textContent = g ? `${g.lap}周目　ラウンド ${g.round} / ${g.roundsPerLap}` : '';
   $('notice').textContent = s.notice || '';
   $('notice').hidden = !s.notice;
@@ -160,10 +274,21 @@ function renderPlayers() {
     name.className = 'player-name';
     name.textContent = p.name;
     li.append(icon, name);
+    li.classList.toggle('away', !p.connected);
     if (p.id === state.hostId) li.append(badge('👑', 'ホスト'));
+    if (p.id === state.pendingHostId) li.append(badge('次のホスト', '次のラウンドからホスト', 'badge-wait'));
     if (state.game && p.id === state.game.parentId) li.append(badge('親', '今回の親', 'badge-parent'));
     if (p.id === state.me) li.append(badge('あなた', null, 'badge-me'));
+    if (!p.connected) li.append(badge('離席中', null, 'badge-away'));
     if (state.game && !p.inGame) li.append(badge('次のゲームから', null, 'badge-wait'));
+    if (isHost() && p.id !== state.me && p.connected && p.id !== state.pendingHostId) {
+      const give = document.createElement('button');
+      give.type = 'button';
+      give.className = 'btn btn-small btn-give';
+      give.textContent = '👑を譲る';
+      give.addEventListener('click', () => transferHost(p));
+      li.append(give);
+    }
 
     const stats = document.createElement('span');
     stats.className = 'player-stats';
@@ -294,9 +419,12 @@ function submitDrawing() {
 function renderSelect() {
   const g = state.game;
   $('select-topic').textContent = g.topic;
+  const parentAway = !state.players.find((p) => p.id === g.parentId)?.connected;
   $('select-info').textContent = isParent()
     ? '1位にしたい絵をタップして選んでください'
-    : `${nameOf(g.parentId)}さんが1位を選んでいます…`;
+    : parentAway
+      ? `${nameOf(g.parentId)}さんが離席中です。時間内に戻れば選べます…`
+      : `${nameOf(g.parentId)}さんが1位を選んでいます…`;
   renderGallery($('select-gallery'), false);
 }
 
@@ -435,7 +563,7 @@ $('copy-url').addEventListener('click', async () => {
 
 function updateTimer() {
   const timer = $('timer');
-  if (!deadline || !joined) {
+  if (!deadline || !inRoom) {
     timer.hidden = true;
     return;
   }

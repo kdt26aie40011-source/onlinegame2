@@ -20,10 +20,16 @@ const SETTING_RULES = {
 const SELECT_TIME_MS = 15_000;
 const SELECT_TIME_MANY_MS = 30_000; // 子が10人以上のとき
 const COLLECT_GRACE_MS = 3_000; // 時間切れ後、各端末から絵が届くのを待つ時間
-const EMPTY_ROOM_TTL_MS = 120_000;
+const SEAT_HOLD_MS = Number(process.env.SEAT_HOLD_MS) || 120_000; // 切断・退出後に席を保持する時間
+const EMPTY_ROOM_TTL_MS = Number(process.env.EMPTY_ROOM_TTL_MS) || 120_000;
+
+// ホストの操作でしか進まない場面。ここではホストが抜けたら即時に引き継ぐ
+const HOST_DRIVEN_PHASES = new Set(['lobby', 'result']);
 
 const IMAGE_MAX_LENGTH = 2_000_000;
 const IMAGE_PATTERN = /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/;
+
+const PARENT_ABSENT_MESSAGE = '親が不在のため今回は1位なしです';
 
 // 親が時間内にお題を決めなかったときに使うお題
 const FALLBACK_TOPICS = [
@@ -62,14 +68,21 @@ function randomRoomId() {
   return id;
 }
 
+function sameToken(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 class Room {
   constructor(id, io, onClose) {
     this.id = id;
     this.io = io;
     this.onClose = onClose;
-    this.players = new Map(); // playerId -> { id, name, icon, socketId, order, stats }
+    // playerId -> { id, token, name, icon, socketId, connected, order, stats, releaseTimer }
+    this.players = new Map();
     this.nextOrder = 0;
     this.hostId = null;
+    this.pendingHostId = null; // 手動譲渡の予約（ラウンドの切り替わりで反映）
     this.settings = {
       topicTimeSec: SETTING_RULES.topicTimeSec.initial,
       drawTimeSec: SETTING_RULES.drawTimeSec.initial,
@@ -82,6 +95,7 @@ class Room {
     this.deadline = null;
     this.notice = null;
     this.emptyTimer = null;
+    this.closed = false;
     this.scheduleCloseIfEmpty();
   }
 
@@ -92,6 +106,7 @@ class Room {
     return { icons: ICONS, nameMax: NAME_MAX, full: this.isFull() };
   }
 
+  // 離席中で席を保持している人も1人に数える
   isFull() {
     return this.players.size >= MAX_PARTICIPANTS;
   }
@@ -106,24 +121,78 @@ class Room {
       return { ok: false, error: '同じ名前の人がすでに部屋にいます。別の名前にしてください' };
     }
 
-    const id = crypto.randomUUID();
-    this.players.set(id, {
-      id,
+    const player = {
+      id: crypto.randomUUID(),
+      token: crypto.randomBytes(24).toString('base64url'),
       name,
       icon,
-      socketId: socket.id,
+      socketId: null,
+      connected: false,
       order: this.nextOrder++,
       stats: { wins: 0, likes: 0 },
-    });
-    if (!this.hostId) this.hostId = id;
+      releaseTimer: null,
+    };
+    this.players.set(player.id, player);
+    this.attach(socket, player);
+    if (!this.hostId) this.hostId = player.id;
+    this.ensureHostIfIdle();
+    return { ok: true, playerId: player.id, token: player.token };
+  }
+
+  // 2分以内に戻ってきた人を、同じ席（成績もそのまま）に戻す
+  rejoin(socket, playerId, token) {
+    const player = typeof playerId === 'string' ? this.players.get(playerId) : undefined;
+    if (!player || !sameToken(player.token, token)) {
+      return { ok: false, error: '席が見つかりません。2分以上たったか、部屋が終了した可能性があります' };
+    }
+    this.attach(socket, player);
+    this.ensureHostIfIdle();
+    return { ok: true, playerId: player.id, token: player.token };
+  }
+
+  attach(socket, player) {
+    // 別のタブ・端末で入り直したら、古い接続は切り離す
+    if (player.socketId && player.socketId !== socket.id) {
+      const old = this.io.sockets.sockets.get(player.socketId);
+      if (old) {
+        old.data.roomId = null;
+        old.emit('replaced');
+        old.leave(this.id);
+      }
+    }
+    clearTimeout(player.releaseTimer);
+    player.releaseTimer = null;
+    player.socketId = socket.id;
+    player.connected = true;
     socket.join(this.id);
     clearTimeout(this.emptyTimer);
     this.emptyTimer = null;
-    return { ok: true, playerId: id };
   }
 
-  leave(playerId) {
-    if (!this.players.delete(playerId)) return;
+  // 通信切断・自分での退出。どちらも2分間は席を保持する
+  disconnect(playerId) {
+    const player = this.players.get(playerId);
+    if (!player || !player.connected) return;
+    player.connected = false;
+    player.socketId = null;
+    player.releaseTimer = setTimeout(() => this.release(playerId), SEAT_HOLD_MS);
+
+    const round = this.game?.round;
+    if (round && round.parentId === playerId && this.phase === 'topic') {
+      this.redrawParent(playerId);
+    }
+    this.ensureHostIfIdle();
+
+    if (this.connectedPlayers().length === 0) this.scheduleCloseIfEmpty();
+    this.broadcast();
+  }
+
+  // 2分たっても戻らなかった人の席を解放する
+  release(playerId) {
+    const player = this.players.get(playerId);
+    if (!player || player.connected) return;
+    this.players.delete(playerId);
+    if (this.pendingHostId === playerId) this.pendingHostId = null;
 
     if (this.players.size === 0) {
       this.clearTimer();
@@ -134,36 +203,24 @@ class Room {
       return;
     }
 
-    if (this.hostId === playerId) this.hostId = this.sortedPlayers()[0].id;
+    if (this.hostId === playerId) this.changeHost(this.nextHostCandidate() ?? this.sortedPlayers()[0]);
     this.clampParentsSetting();
-
-    if (this.game) this.handleLeaveDuringGame(playerId);
+    if (this.game) this.handleReleaseDuringGame(playerId);
     this.broadcast();
   }
 
-  handleLeaveDuringGame(playerId) {
-    const g = this.game;
-    if (this.presentParticipants().length < 2) {
+  handleReleaseDuringGame(playerId) {
+    if (this.seatedParticipants().length < 2) {
       this.endGame('人数が足りなくなったため、ゲームを終了しました');
       return;
     }
-    const round = g.round;
+    const round = this.game.round;
     if (!round) return;
 
-    if (round.parentId === playerId) {
-      if (this.phase === 'topic') {
-        // 抜けた親は「この周で親をやっていない」扱いにして再抽選
-        g.doneParents.delete(playerId);
-        round.parentId = this.pickParent(this.presentParticipants());
-        this.notice = '親が抜けたため、親を選び直しました';
-        this.setPhase('topic', g.topicTimeMs, () => this.onTopicTimeout());
-      } else if (this.phase === 'select') {
-        this.showResult({ message: '親が不在のため今回は1位なしです' });
-      }
-      // お絵描き中はそのまま続行し、1位選定の直前に判断する
+    if (round.parentId === playerId && this.phase === 'select') {
+      this.showResult({ message: PARENT_ABSENT_MESSAGE });
       return;
     }
-
     if ((this.phase === 'draw' || this.phase === 'collect') && this.allChildrenSubmitted()) {
       this.finishDrawing();
     }
@@ -172,13 +229,76 @@ class Room {
   scheduleCloseIfEmpty() {
     clearTimeout(this.emptyTimer);
     this.emptyTimer = setTimeout(() => {
-      if (this.players.size === 0) this.onClose(this);
+      if (this.connectedPlayers().length === 0) this.close();
     }, EMPTY_ROOM_TTL_MS);
   }
 
+  // ホストによる強制終了
+  forceClose(playerId) {
+    if (playerId !== this.hostId) return { ok: false, error: 'ホストだけが部屋を終了できます' };
+    this.io.to(this.id).emit('room:closed');
+    this.close();
+    return { ok: true };
+  }
+
   close() {
+    if (this.closed) return;
+    this.closed = true;
     this.clearTimer();
     clearTimeout(this.emptyTimer);
+    for (const player of this.players.values()) clearTimeout(player.releaseTimer);
+    for (const socket of this.io.sockets.sockets.values()) {
+      if (socket.data.roomId === this.id) socket.data.roomId = null;
+    }
+    this.io.in(this.id).socketsLeave(this.id);
+    this.onClose(this);
+  }
+
+  // ---- ホスト権限 ----
+
+  transferHost(playerId, targetId) {
+    if (playerId !== this.hostId) return { ok: false, error: 'ホストだけが譲渡できます' };
+    const target = this.players.get(targetId);
+    if (!target || targetId === playerId) return { ok: false, error: 'その人には譲渡できません' };
+    if (!target.connected) return { ok: false, error: '離席中の人には譲渡できません' };
+
+    if (this.phase === 'lobby') {
+      this.changeHost(target);
+    } else {
+      // ゲーム中はラウンドが切り替わるタイミングで反映する
+      this.pendingHostId = targetId;
+      this.notifyAll(`👑 次のラウンドから${target.name}さんがホストになります`);
+    }
+    this.broadcast();
+    return { ok: true };
+  }
+
+  applyPendingHost() {
+    const target = this.players.get(this.pendingHostId);
+    this.pendingHostId = null;
+    if (target?.connected && target.id !== this.hostId) this.changeHost(target);
+  }
+
+  // ホストが離席中なら、入室順が次に早い（いる）人へ移す
+  ensureHost() {
+    if (this.players.get(this.hostId)?.connected) return;
+    const next = this.nextHostCandidate();
+    if (next) this.changeHost(next);
+  }
+
+  ensureHostIfIdle() {
+    if (HOST_DRIVEN_PHASES.has(this.phase)) this.ensureHost();
+  }
+
+  nextHostCandidate() {
+    return this.connectedPlayers().find((p) => p.id !== this.hostId);
+  }
+
+  changeHost(player) {
+    if (!player || player.id === this.hostId) return;
+    this.hostId = player.id;
+    if (this.pendingHostId === player.id) this.pendingHostId = null;
+    this.notifyAll(`👑 ホストが${player.name}さんに代わりました`);
   }
 
   // ---- ゲーム設定 ----
@@ -256,9 +376,10 @@ class Room {
 
   startRound() {
     const g = this.game;
-    const present = this.presentParticipants();
+    this.applyPendingHost();
+    const seated = this.seatedParticipants();
     // 参加者が減ったら、1周あたりの親の人数も合わせて下げる
-    g.parentsPerLap = Math.min(g.parentsPerLap, present.length);
+    g.parentsPerLap = Math.min(g.parentsPerLap, seated.length);
 
     if (g.roundInLap >= g.parentsPerLap) {
       g.lap++;
@@ -266,11 +387,11 @@ class Room {
       g.doneParents.clear();
     }
     if (g.lap > g.laps) return this.endGame('ゲーム終了！おつかれさまでした');
-    if (present.length < 2) return this.endGame('人数が足りないため、ゲームを終了しました');
+    if (seated.length < 2) return this.endGame('人数が足りないため、ゲームを終了しました');
 
     g.roundInLap++;
     g.round = {
-      parentId: this.pickParent(present),
+      parentId: this.pickParent(),
       topic: null,
       topicAuto: false,
       childIds: [],
@@ -282,13 +403,27 @@ class Room {
     this.setPhase('topic', g.topicTimeMs, () => this.onTopicTimeout());
   }
 
-  pickParent(present) {
+  // その周でまだ親になっていない、離席していない人から選ぶ
+  pickParent() {
     const g = this.game;
-    let candidates = present.filter((id) => !g.doneParents.has(id));
-    if (candidates.length === 0) candidates = present;
+    const connected = this.connectedParticipants();
+    let candidates = connected.filter((id) => !g.doneParents.has(id));
+    if (candidates.length === 0) candidates = connected;
+    if (candidates.length === 0) candidates = this.seatedParticipants();
     const parentId = randomItem(candidates);
     g.doneParents.add(parentId);
     return parentId;
+  }
+
+  // お題入力中に親が抜けたら、親を選び直してお題入力からやり直す
+  redrawParent(oldParentId) {
+    const g = this.game;
+    if (this.connectedParticipants().length === 0) return;
+    // 抜けた親は、その周で「親をやっていない」扱いにする
+    g.doneParents.delete(oldParentId);
+    g.round.parentId = this.pickParent();
+    this.notice = '親が抜けたため、親を選び直しました';
+    this.setPhase('topic', g.topicTimeMs, () => this.onTopicTimeout());
   }
 
   submitTopic(playerId, rawTopic) {
@@ -314,7 +449,8 @@ class Room {
 
   startDrawing() {
     const round = this.game.round;
-    round.childIds = this.presentParticipants().filter((id) => id !== round.parentId);
+    // 離席中の子も、2分以内に戻れば続きから描けるように含めておく
+    round.childIds = this.seatedParticipants().filter((id) => id !== round.parentId);
     this.setPhase('draw', this.game.drawTimeMs, () => {
       // 時間切れ：各端末に「今の絵を送って」と伝え、少しだけ待つ
       this.setPhase('collect', COLLECT_GRACE_MS, () => this.finishDrawing());
@@ -357,14 +493,15 @@ class Room {
     round.order = shuffle([...round.drawings.values()]);
 
     if (round.order.length === 0) return this.showResult({ message: '絵が1枚も届きませんでした' });
-    if (!this.players.has(round.parentId)) return this.showResult({ message: '親が不在のため今回は1位なしです' });
+    // 1位選定タイムまでに親が戻っていなければ、選定をスキップする
+    if (!this.isConnected(round.parentId)) return this.showResult({ message: PARENT_ABSENT_MESSAGE });
 
     const selectTime = round.childIds.length >= 10 ? SELECT_TIME_MANY_MS : SELECT_TIME_MS;
     this.setPhase('select', selectTime, () => {
       const parent = this.players.get(round.parentId);
-      const message = parent
+      const message = parent?.connected
         ? randomItem(TEASE_MESSAGES).replace('{name}', parent.name)
-        : '親が不在のため今回は1位なしです';
+        : PARENT_ABSENT_MESSAGE;
       this.showResult({ message });
     });
   }
@@ -405,7 +542,7 @@ class Room {
     if (author) {
       author.stats.likes++;
       // いいねは匿名。誰が押したかは伝えない
-      this.io.to(author.socketId).emit('notify', { message: 'あなたの絵がいいねされました！' });
+      if (author.socketId) this.io.to(author.socketId).emit('notify', { message: 'あなたの絵がいいねされました！' });
     }
     this.broadcast();
     return { ok: true };
@@ -416,6 +553,8 @@ class Room {
     this.game = null;
     this.phase = 'lobby';
     this.notice = notice;
+    this.applyPendingHost();
+    this.ensureHost();
     this.broadcast();
   }
 
@@ -424,6 +563,8 @@ class Room {
   setPhase(phase, durationMs, onTimeout) {
     this.clearTimer();
     this.phase = phase;
+    // 時間で進む工程では、ホストの引き継ぎは工程が切り替わるタイミングで行う
+    this.ensureHost();
     if (durationMs > 0 && onTimeout) {
       this.deadline = Date.now() + durationMs;
       this.timer = setTimeout(onTimeout, durationMs);
@@ -437,18 +578,36 @@ class Room {
     this.deadline = null;
   }
 
+  notifyAll(message) {
+    this.io.to(this.id).emit('notify', { message });
+  }
+
+  isConnected(playerId) {
+    return !!this.players.get(playerId)?.connected;
+  }
+
   sortedPlayers() {
     return [...this.players.values()].sort((a, b) => a.order - b.order);
   }
 
-  presentParticipants() {
+  connectedPlayers() {
+    return this.sortedPlayers().filter((p) => p.connected);
+  }
+
+  // 席がある（離席中を含む）ゲーム参加者
+  seatedParticipants() {
     if (!this.game) return [];
     return this.sortedPlayers().map((p) => p.id).filter((id) => this.game.participants.has(id));
   }
 
+  connectedParticipants() {
+    return this.seatedParticipants().filter((id) => this.isConnected(id));
+  }
+
   broadcast() {
+    if (this.closed) return;
     for (const player of this.players.values()) {
-      this.io.to(player.socketId).emit('state', this.viewFor(player.id));
+      if (player.socketId) this.io.to(player.socketId).emit('state', this.viewFor(player.id));
     }
   }
 
@@ -463,6 +622,7 @@ class Room {
       roomId: this.id,
       me: playerId,
       hostId: this.hostId,
+      pendingHostId: this.pendingHostId,
       phase: this.phase,
       remainingMs: this.deadline ? Math.max(0, this.deadline - Date.now()) : null,
       notice: this.notice,
@@ -474,6 +634,7 @@ class Room {
         name: p.name,
         icon: p.icon,
         stats: p.stats,
+        connected: p.connected,
         inGame: g ? g.participants.has(p.id) : false,
       })),
       game: g && round && {
@@ -513,18 +674,13 @@ class RoomManager {
   create() {
     let id;
     do id = randomRoomId(); while (this.rooms.has(id));
-    const room = new Room(id, this.io, (r) => this.remove(r));
+    const room = new Room(id, this.io, (r) => this.rooms.delete(r.id));
     this.rooms.set(id, room);
     return room;
   }
 
   get(id) {
     return typeof id === 'string' ? this.rooms.get(id) : undefined;
-  }
-
-  remove(room) {
-    room.close();
-    this.rooms.delete(room.id);
   }
 }
 
