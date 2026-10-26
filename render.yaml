@@ -1,0 +1,13 @@
+# Render の Blueprint 設定（Render の「New → Blueprint」でこのリポジトリを選ぶと読み込まれる）
+services:
+  - type: web
+    name: urodoro
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22
