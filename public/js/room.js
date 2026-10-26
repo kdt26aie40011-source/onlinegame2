@@ -22,23 +22,71 @@ const board = new DrawingBoard($('canvas'), {
 
 // ---- 入室 ----
 
+const ROOM_NOT_FOUND = '部屋が見つかりません。URLを確認するか、新しく部屋を作ってください。';
+let selectedIcon = null;
+
 $('name-input').value = safeStorage('get', 'urodoro.name') || '';
+loadRoomInfo();
+
+async function loadRoomInfo() {
+  try {
+    const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`);
+    if (res.status === 404) return showError(ROOM_NOT_FOUND);
+    const info = await res.json();
+    renderIconPicker(info.icons);
+    if (info.full) showJoinError('部屋が満員です');
+  } catch {
+    showJoinError('部屋の情報を読み込めませんでした。再読み込みしてください');
+  }
+}
+
+function renderIconPicker(icons) {
+  const saved = safeStorage('get', 'urodoro.icon');
+  selectedIcon = icons.includes(saved) ? saved : icons[Math.floor(Math.random() * icons.length)];
+  const picker = $('icon-picker');
+  picker.replaceChildren();
+  for (const icon of icons) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'icon-option';
+    button.textContent = icon;
+    button.setAttribute('role', 'radio');
+    button.addEventListener('click', () => {
+      selectedIcon = icon;
+      updateIconPicker();
+    });
+    picker.append(button);
+  }
+  updateIconPicker();
+}
+
+function updateIconPicker() {
+  for (const button of $('icon-picker').children) {
+    const selected = button.textContent === selectedIcon;
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-checked', String(selected));
+  }
+}
+
+function showJoinError(message) {
+  $('join-error').textContent = message;
+  $('join-error').hidden = false;
+}
 
 $('join-form').addEventListener('submit', (e) => {
   e.preventDefault();
   const name = $('name-input').value.trim();
-  const button = e.submitter;
-  if (button) button.disabled = true;
-  socket.emit('join', { roomId, name }, (res) => {
-    if (button) button.disabled = false;
+  const button = $('join-button');
+  button.disabled = true;
+  socket.emit('join', { roomId, name, icon: selectedIcon }, (res) => {
+    button.disabled = false;
     if (!res.ok) {
-      if (res.error === '部屋が見つかりません') return showError('部屋が見つかりません。URLを確認するか、新しく部屋を作ってください。');
-      $('join-error').textContent = res.error;
-      $('join-error').hidden = false;
-      return;
+      if (res.error === '部屋が見つかりません') return showError(ROOM_NOT_FOUND);
+      return showJoinError(res.error);
     }
     joined = true;
     safeStorage('set', 'urodoro.name', name);
+    safeStorage('set', 'urodoro.icon', selectedIcon);
     // 復帰時の本人確認用（ステップ3で使う）
     safeStorage('set', 'urodoro.playerId', res.playerId);
     $('join-screen').hidden = true;
@@ -51,6 +99,8 @@ socket.on('state', (next) => {
   deadline = next.remainingMs != null ? Date.now() + next.remainingMs : null;
   render();
 });
+
+socket.on('notify', ({ message }) => showToast(message));
 
 socket.on('disconnect', () => {
   if (!joined) return;
@@ -103,14 +153,23 @@ function renderPlayers() {
   list.replaceChildren();
   for (const p of state.players) {
     const li = document.createElement('li');
+    const icon = document.createElement('span');
+    icon.className = 'player-icon';
+    icon.textContent = p.icon;
     const name = document.createElement('span');
     name.className = 'player-name';
     name.textContent = p.name;
-    li.append(name);
+    li.append(icon, name);
     if (p.id === state.hostId) li.append(badge('👑', 'ホスト'));
     if (state.game && p.id === state.game.parentId) li.append(badge('親', '今回の親', 'badge-parent'));
     if (p.id === state.me) li.append(badge('あなた', null, 'badge-me'));
     if (state.game && !p.inGame) li.append(badge('次のゲームから', null, 'badge-wait'));
+
+    const stats = document.createElement('span');
+    stats.className = 'player-stats';
+    stats.textContent = `🏆${p.stats.wins}　❤${p.stats.likes}`;
+    stats.title = `1位 ${p.stats.wins}回・いいね ${p.stats.likes}`;
+    li.append(stats);
     list.append(li);
   }
 }
@@ -142,6 +201,39 @@ function renderLobby() {
   } else {
     $('lobby-wait').textContent = `ホスト（${nameOf(state.hostId)}）がゲームを始めるのを待っています…`;
   }
+  renderSettings();
+}
+
+const SETTING_SELECTS = ['setting-topic-time', 'setting-draw-time', 'setting-parents', 'setting-laps'];
+
+function renderSettings() {
+  for (const id of SETTING_SELECTS) {
+    const select = $(id);
+    const { key, unit } = select.dataset;
+    const rule = state.settingRules[key];
+    const options = [];
+    if (key === 'parentsPerLap') options.push({ value: 'all', label: '全員' });
+    for (let v = rule.min; v <= rule.max; v += rule.step ?? 1) options.push({ value: String(v), label: `${v}${unit}` });
+
+    // 選択肢が変わったときだけ作り直す（開いているドロップダウンを閉じないように）
+    const signature = options.map((o) => o.value).join(',');
+    if (select.dataset.signature !== signature) {
+      select.dataset.signature = signature;
+      select.replaceChildren(...options.map(({ value, label }) => new Option(label, value)));
+    }
+    const current = state.settings[key];
+    select.value = current === null ? 'all' : String(current);
+    select.disabled = !isHost();
+  }
+  $('settings-hint').textContent = isHost() ? '' : '設定を変更できるのはホストだけです。';
+}
+
+for (const id of SETTING_SELECTS) {
+  $(id).addEventListener('change', (e) => {
+    const { key } = e.target.dataset;
+    const value = e.target.value === 'all' ? null : Number(e.target.value);
+    emitAction('settings:update', { [key]: value });
+  });
 }
 
 function renderTopic() {
@@ -221,30 +313,68 @@ function renderResult() {
   $('result-wait').textContent = isHost() ? '' : `ホスト（${nameOf(state.hostId)}）が次へ進むのを待っています…`;
 }
 
+const likeButtons = new Map(); // drawingId -> button
+
 function renderGallery(container, reveal) {
   const g = state.game;
   const key = `${state.phase}:${roundKey()}:${g.drawings.map((d) => d.id).join(',')}`;
-  if (galleryKey === key && container.childElementCount === g.drawings.length) return;
-  galleryKey = key;
+  if (galleryKey !== key || container.childElementCount !== g.drawings.length) {
+    galleryKey = key;
+    buildGallery(container, reveal);
+  }
+  if (reveal) updateLikeButtons();
+}
 
+function buildGallery(container, reveal) {
+  const g = state.game;
+  likeButtons.clear();
   container.replaceChildren();
   for (const d of g.drawings) {
-    const card = document.createElement('button');
-    card.type = 'button';
+    const card = document.createElement('div');
     card.className = 'drawing-card';
     if (reveal && d.id === g.winnerDrawingId) card.classList.add('winner');
+
+    const thumb = document.createElement('button');
+    thumb.type = 'button';
+    thumb.className = 'drawing-thumb';
+    thumb.addEventListener('click', () => openZoom(d));
     const img = document.createElement('img');
     img.src = d.image;
     img.alt = reveal ? `${d.authorName}さんの絵` : '子の絵';
-    card.append(img);
+    thumb.append(img);
+    card.append(thumb);
+
     if (reveal) {
+      const footer = document.createElement('div');
+      footer.className = 'drawing-footer';
       const caption = document.createElement('span');
       caption.className = 'drawing-author';
       caption.textContent = (d.id === g.winnerDrawingId ? '🏆 ' : '') + d.authorName;
-      card.append(caption);
+      const like = document.createElement('button');
+      like.type = 'button';
+      like.className = 'like-button';
+      like.addEventListener('click', () => emitAction('drawing:like', { drawingId: d.id }));
+      likeButtons.set(d.id, like);
+      footer.append(caption, like);
+      card.append(footer);
     }
-    card.addEventListener('click', () => openZoom(d));
     container.append(card);
+  }
+}
+
+function updateLikeButtons() {
+  const me = state.players.find((p) => p.id === state.me);
+  const canLike = !!me?.inGame;
+  for (const d of state.game.drawings) {
+    const button = likeButtons.get(d.id);
+    if (!button) continue;
+    const mine = d.authorId === state.me;
+    button.textContent = `${d.likedByMe ? '❤' : '♡'} ${d.likeCount}`;
+    button.classList.toggle('liked', d.likedByMe);
+    button.disabled = mine || d.likedByMe || !canLike;
+    button.title = mine ? '自分の絵にはいいねできません'
+      : d.likedByMe ? 'いいねしました'
+        : canLike ? 'いいね' : '観戦中はいいねできません';
   }
 }
 

@@ -13,7 +13,9 @@
     <form id="join-form" class="card join-card">
       <label for="name-input">名前（9文字まで）</label>
       <input id="name-input" type="text" maxlength="9" autocomplete="nickname" required>
-      <button class="btn btn-primary" type="submit">入室する</button>
+      <span class="label">アイコン</span>
+      <div id="icon-picker" class="icon-picker" role="radiogroup" aria-label="アイコン"></div>
+      <button id="join-button" class="btn btn-primary" type="submit">入室する</button>
       <p id="join-error" class="error" hidden></p>
     </form>
   </main>
@@ -49,6 +51,20 @@
             <input id="room-url" type="text" readonly>
             <button id="copy-url" class="btn" type="button">コピー</button>
           </div>
+        </div>
+        <div class="card">
+          <h2>ゲーム設定</h2>
+          <div class="settings">
+            <label for="setting-topic-time">お題入力時間</label>
+            <select id="setting-topic-time" data-key="topicTimeSec" data-unit="秒"></select>
+            <label for="setting-draw-time">お絵描き時間</label>
+            <select id="setting-draw-time" data-key="drawTimeSec" data-unit="秒"></select>
+            <label for="setting-parents">1周あたりの親の人数</label>
+            <select id="setting-parents" data-key="parentsPerLap" data-unit="人"></select>
+            <label for="setting-laps">周回数</label>
+            <select id="setting-laps" data-key="laps" data-unit="周"></select>
+          </div>
+          <p id="settings-hint" class="hint"></p>
         </div>
         <button id="start-game" class="btn btn-primary btn-large" hidden>ゲーム開始</button>
         <p id="lobby-wait" class="hint"></p>

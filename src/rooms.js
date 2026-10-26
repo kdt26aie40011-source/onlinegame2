@@ -4,11 +4,19 @@ const ROOM_ID_LENGTH = 12;
 const ROOM_ID_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
 const NAME_MAX = 9;
 const TOPIC_MAX = 20;
+const MAX_PARTICIPANTS = 9;
 const MAX_PARENTS_PER_LAP = 9;
 
-// ステップ1では制限時間は固定値
-const TOPIC_TIME_MS = 30_000;
-const DRAW_TIME_MS = 100_000;
+// デフォルメ動物のアイコン（重複可）
+const ICONS = ['🐶', '🐱', '🐰', '🐻', '🐼', '🦊', '🐸', '🐷', '🐵', '🐯', '🐨', '🐹', '🐧', '🐮', '🐔', '🦁'];
+
+// ホストが変更できるゲーム設定の範囲
+const SETTING_RULES = {
+  topicTimeSec: { min: 20, max: 50, step: 5, initial: 30 },
+  drawTimeSec: { min: 30, max: 200, step: 10, initial: 100 },
+  laps: { min: 1, max: 3, step: 1, initial: 1 },
+};
+
 const SELECT_TIME_MS = 15_000;
 const SELECT_TIME_MANY_MS = 30_000; // 子が10人以上のとき
 const COLLECT_GRACE_MS = 3_000; // 時間切れ後、各端末から絵が届くのを待つ時間
@@ -59,9 +67,15 @@ class Room {
     this.id = id;
     this.io = io;
     this.onClose = onClose;
-    this.players = new Map(); // playerId -> { id, name, socketId, order }
+    this.players = new Map(); // playerId -> { id, name, icon, socketId, order, stats }
     this.nextOrder = 0;
     this.hostId = null;
+    this.settings = {
+      topicTimeSec: SETTING_RULES.topicTimeSec.initial,
+      drawTimeSec: SETTING_RULES.drawTimeSec.initial,
+      parentsPerLap: null, // null は「全員」
+      laps: SETTING_RULES.laps.initial,
+    };
     this.phase = 'lobby'; // lobby | topic | draw | collect | select | result
     this.game = null;
     this.timer = null;
@@ -73,13 +87,34 @@ class Room {
 
   // ---- 入退室 ----
 
-  join(socket, rawName) {
+  // 入室画面で使う、入室前でも見てよい情報
+  publicInfo() {
+    return { icons: ICONS, nameMax: NAME_MAX, full: this.isFull() };
+  }
+
+  isFull() {
+    return this.players.size >= MAX_PARTICIPANTS;
+  }
+
+  join(socket, rawName, icon) {
     const name = typeof rawName === 'string' ? rawName.trim() : '';
     if (!name) return { ok: false, error: '名前を入力してください' };
     if ([...name].length > NAME_MAX) return { ok: false, error: `名前は${NAME_MAX}文字までです` };
+    if (!ICONS.includes(icon)) return { ok: false, error: 'アイコンを選んでください' };
+    if (this.isFull()) return { ok: false, error: '部屋が満員です' };
+    if ([...this.players.values()].some((p) => p.name === name)) {
+      return { ok: false, error: '同じ名前の人がすでに部屋にいます。別の名前にしてください' };
+    }
 
     const id = crypto.randomUUID();
-    this.players.set(id, { id, name, socketId: socket.id, order: this.nextOrder++ });
+    this.players.set(id, {
+      id,
+      name,
+      icon,
+      socketId: socket.id,
+      order: this.nextOrder++,
+      stats: { wins: 0, likes: 0 },
+    });
     if (!this.hostId) this.hostId = id;
     socket.join(this.id);
     clearTimeout(this.emptyTimer);
@@ -100,6 +135,7 @@ class Room {
     }
 
     if (this.hostId === playerId) this.hostId = this.sortedPlayers()[0].id;
+    this.clampParentsSetting();
 
     if (this.game) this.handleLeaveDuringGame(playerId);
     this.broadcast();
@@ -120,7 +156,7 @@ class Room {
         g.doneParents.delete(playerId);
         round.parentId = this.pickParent(this.presentParticipants());
         this.notice = '親が抜けたため、親を選び直しました';
-        this.setPhase('topic', TOPIC_TIME_MS, () => this.onTopicTimeout());
+        this.setPhase('topic', g.topicTimeMs, () => this.onTopicTimeout());
       } else if (this.phase === 'select') {
         this.showResult({ message: '親が不在のため今回は1位なしです' });
       }
@@ -145,6 +181,46 @@ class Room {
     clearTimeout(this.emptyTimer);
   }
 
+  // ---- ゲーム設定 ----
+
+  updateSettings(playerId, input) {
+    if (playerId !== this.hostId) return { ok: false, error: 'ホストだけが設定を変更できます' };
+    if (this.phase !== 'lobby') return { ok: false, error: 'ゲーム中は設定を変更できません' };
+
+    const next = { ...this.settings };
+    for (const [key, rule] of Object.entries(SETTING_RULES)) {
+      if (input[key] === undefined) continue;
+      const value = input[key];
+      if (!Number.isInteger(value) || value < rule.min || value > rule.max || (value - rule.min) % rule.step !== 0) {
+        return { ok: false, error: '設定の値が正しくありません' };
+      }
+      next[key] = value;
+    }
+    if (input.parentsPerLap !== undefined) {
+      const value = input.parentsPerLap;
+      if (value !== null && (!Number.isInteger(value) || value < 1 || value > this.maxParentsPerLap())) {
+        return { ok: false, error: '親の人数が正しくありません' };
+      }
+      next.parentsPerLap = value;
+    }
+
+    this.settings = next;
+    this.broadcast();
+    return { ok: true };
+  }
+
+  maxParentsPerLap() {
+    return Math.max(1, Math.min(this.players.size, MAX_PARENTS_PER_LAP));
+  }
+
+  // 参加者が減って親の人数が参加人数を超えたら、参加人数に合わせて下げる
+  clampParentsSetting() {
+    const { parentsPerLap } = this.settings;
+    if (parentsPerLap !== null && parentsPerLap > this.maxParentsPerLap()) {
+      this.settings.parentsPerLap = this.maxParentsPerLap();
+    }
+  }
+
   // ---- ゲーム進行 ----
 
   startGame(playerId) {
@@ -153,11 +229,14 @@ class Room {
     const ids = this.sortedPlayers().map((p) => p.id);
     if (ids.length < 2) return { ok: false, error: '2人以上で開始できます' };
 
+    const { topicTimeSec, drawTimeSec, parentsPerLap, laps } = this.settings;
     this.notice = null;
     this.game = {
       participants: new Set(ids),
-      parentsPerLap: Math.min(ids.length, MAX_PARENTS_PER_LAP),
-      laps: 1,
+      topicTimeMs: topicTimeSec * 1000,
+      drawTimeMs: drawTimeSec * 1000,
+      parentsPerLap: Math.min(parentsPerLap ?? ids.length, ids.length, MAX_PARENTS_PER_LAP),
+      laps,
       lap: 1,
       roundInLap: 0,
       doneParents: new Set(),
@@ -195,12 +274,12 @@ class Room {
       topic: null,
       topicAuto: false,
       childIds: [],
-      drawings: new Map(), // authorId -> { id, authorId, authorName, image }
+      drawings: new Map(), // authorId -> { id, authorId, authorName, image, likedBy }
       order: [],
       winnerDrawingId: null,
       message: null,
     };
-    this.setPhase('topic', TOPIC_TIME_MS, () => this.onTopicTimeout());
+    this.setPhase('topic', g.topicTimeMs, () => this.onTopicTimeout());
   }
 
   pickParent(present) {
@@ -236,7 +315,7 @@ class Room {
   startDrawing() {
     const round = this.game.round;
     round.childIds = this.presentParticipants().filter((id) => id !== round.parentId);
-    this.setPhase('draw', DRAW_TIME_MS, () => {
+    this.setPhase('draw', this.game.drawTimeMs, () => {
       // 時間切れ：各端末に「今の絵を送って」と伝え、少しだけ待つ
       this.setPhase('collect', COLLECT_GRACE_MS, () => this.finishDrawing());
     });
@@ -258,6 +337,7 @@ class Room {
       authorId: playerId,
       authorName: player.name,
       image,
+      likedBy: new Set(),
     });
 
     if (this.allChildrenSubmitted()) this.finishDrawing();
@@ -296,6 +376,9 @@ class Room {
     }
     const drawing = round.order.find((d) => d.id === drawingId);
     if (!drawing) return { ok: false, error: 'その絵は見つかりません' };
+
+    const author = this.players.get(drawing.authorId);
+    if (author) author.stats.wins++;
     this.showResult({ winnerDrawingId: drawing.id });
     return { ok: true };
   }
@@ -305,6 +388,27 @@ class Room {
     round.winnerDrawingId = winnerDrawingId;
     round.message = message;
     this.setPhase('result', 0);
+  }
+
+  like(playerId, drawingId) {
+    const round = this.game?.round;
+    if (this.phase !== 'result') return { ok: false, error: '今はいいねできません' };
+    // 観戦モード（次のゲームから参加の人）は閲覧のみ
+    if (!this.game.participants.has(playerId)) return { ok: false, error: '観戦中はいいねできません' };
+    const drawing = round.order.find((d) => d.id === drawingId);
+    if (!drawing) return { ok: false, error: 'その絵は見つかりません' };
+    if (drawing.authorId === playerId) return { ok: false, error: '自分の絵にはいいねできません' };
+    if (drawing.likedBy.has(playerId)) return { ok: false, error: 'この絵にはもういいねしています' };
+
+    drawing.likedBy.add(playerId);
+    const author = this.players.get(drawing.authorId);
+    if (author) {
+      author.stats.likes++;
+      // いいねは匿名。誰が押したかは伝えない
+      this.io.to(author.socketId).emit('notify', { message: 'あなたの絵がいいねされました！' });
+    }
+    this.broadcast();
+    return { ok: true };
   }
 
   endGame(notice) {
@@ -363,9 +467,13 @@ class Room {
       remainingMs: this.deadline ? Math.max(0, this.deadline - Date.now()) : null,
       notice: this.notice,
       limits: { nameMax: NAME_MAX, topicMax: TOPIC_MAX },
+      settings: this.settings,
+      settingRules: { ...SETTING_RULES, parentsPerLap: { min: 1, max: this.maxParentsPerLap() } },
       players: this.sortedPlayers().map((p) => ({
         id: p.id,
         name: p.name,
+        icon: p.icon,
+        stats: p.stats,
         inGame: g ? g.participants.has(p.id) : false,
       })),
       game: g && round && {
@@ -385,6 +493,8 @@ class Room {
             image: d.image,
             authorId: revealAuthors ? d.authorId : null,
             authorName: revealAuthors ? d.authorName : null,
+            likeCount: revealAuthors ? d.likedBy.size : 0,
+            likedByMe: revealAuthors && d.likedBy.has(playerId),
           }))
           : null,
         winnerDrawingId: revealAuthors ? round.winnerDrawingId : null,

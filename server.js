@@ -20,6 +20,12 @@ app.post('/api/rooms', (req, res) => {
   res.json({ roomId: room.id });
 });
 
+app.get('/api/rooms/:roomId', (req, res) => {
+  const room = rooms.get(req.params.roomId);
+  if (!room) return res.status(404).json({ error: '部屋が見つかりません' });
+  res.json(room.publicInfo());
+});
+
 app.get('/r/:roomId', (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'room.html'));
 });
@@ -40,11 +46,11 @@ io.on('connection', (socket) => {
 
   const currentRoom = () => rooms.get(socket.data.roomId);
 
-  on('join', ({ roomId, name }, reply) => {
+  on('join', ({ roomId, name, icon }, reply) => {
     if (socket.data.roomId) return reply({ ok: false, error: 'すでに入室しています' });
     const room = rooms.get(roomId);
     if (!room) return reply({ ok: false, error: '部屋が見つかりません' });
-    const result = room.join(socket, name);
+    const result = room.join(socket, name, icon);
     if (!result.ok) return reply(result);
     socket.data.roomId = room.id;
     socket.data.playerId = result.playerId;
@@ -61,11 +67,13 @@ io.on('connection', (socket) => {
     });
   };
 
+  action('settings:update', (room, pid, settings) => room.updateSettings(pid, settings));
   action('game:start', (room, pid) => room.startGame(pid));
   action('game:next', (room, pid) => room.next(pid));
   action('topic:submit', (room, pid, { topic }) => room.submitTopic(pid, topic));
   action('drawing:submit', (room, pid, { image }) => room.submitDrawing(pid, image));
   action('winner:select', (room, pid, { drawingId }) => room.selectWinner(pid, drawingId));
+  action('drawing:like', (room, pid, { drawingId }) => room.like(pid, drawingId));
 
   socket.on('disconnect', () => {
     const room = currentRoom();
