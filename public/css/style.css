@@ -226,6 +226,48 @@ select:disabled { background: #f7f2ea; color: var(--text); opacity: 1; }
   max-width: calc(100% - 32px);
 }
 
+/* ---- 参加者・観戦者 ---- */
+
+.role-picker { display: flex; gap: 0.5em; flex-wrap: wrap; }
+.role-option {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  margin: 0;
+  padding: 0.5em 0.8em;
+  border: 2px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.role-option:has(input:checked) { border-color: var(--primary); background: #ffe6d8; }
+.role-option:has(input:disabled) { opacity: 0.5; cursor: not-allowed; }
+.role-option small { color: var(--danger); margin-left: 0.2em; }
+
+.players h2 + ul { margin-bottom: 1em; }
+.role-switch { margin-top: 0.5em; }
+
+.watch-banner {
+  max-width: 760px;
+  margin: 0 auto 1em;
+  padding: 0.5em 1em;
+  border-radius: 10px;
+  background: #e8f1ff;
+  color: #2b4a7a;
+  text-align: center;
+  font-weight: bold;
+}
+
+/* ---- みんなでうろドロの結果 ---- */
+
+.mresult-list { width: 100%; display: flex; flex-direction: column; gap: 1em; }
+.topic-result h3 { margin: 0; font-size: 1.2rem; color: var(--primary-dark); }
+.topic-result h4 { margin: 0.8em 0 0.4em; }
+.gallery-small { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.5em; }
+.gallery-small .drawing-author { font-size: 0.85rem; }
+
 .confirm-card { width: min(100%, 360px); text-align: center; }
 .confirm-card p { white-space: pre-line; font-weight: bold; margin: 0 0 1em; }
 .confirm-actions { justify-content: center; }
@@ -368,8 +410,9 @@ select:disabled { background: #f7f2ea; color: var(--text); opacity: 1; }
     grid-template-areas: "header" "players" "stage";
   }
   .players { border-right: none; border-bottom: 2px solid var(--border); padding-block: 0.6em; }
-  .players h2 { display: none; }
+  .players h2 { font-size: 0.85rem; margin-bottom: 0.3em; color: var(--muted); }
   .players ul { flex-direction: row; flex-wrap: wrap; }
+  .players h2 + ul { margin-bottom: 0.5em; }
   .gallery { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
   .round-info { font-size: 0.85rem; }
   .logo-small { font-size: 1.1rem; }

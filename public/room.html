@@ -15,6 +15,18 @@
       <input id="name-input" type="text" maxlength="9" autocomplete="nickname" required>
       <span class="label">アイコン</span>
       <div id="icon-picker" class="icon-picker" role="radiogroup" aria-label="アイコン"></div>
+      <span class="label">入り方</span>
+      <div class="role-picker">
+        <label class="role-option">
+          <input type="radio" name="role" value="player" checked>
+          <span>🎨 参加者<small id="role-player-note"></small></span>
+        </label>
+        <label class="role-option">
+          <input type="radio" name="role" value="spectator">
+          <span>👀 観戦者<small id="role-spectator-note"></small></span>
+        </label>
+      </div>
+      <p id="join-ingame" class="hint" hidden>ゲーム中です。参加者として入ると、次のゲームまで観戦しながら待ちます。</p>
       <button id="join-button" class="btn btn-primary" type="submit">入室する</button>
       <p id="join-error" class="error" hidden></p>
     </form>
@@ -51,11 +63,18 @@
     <p id="connection-banner" class="connection-banner" hidden>接続が切れました。再接続しています…</p>
 
     <aside class="players">
-      <h2>プレイヤー</h2>
+      <h2>参加者</h2>
       <ul id="player-list"></ul>
+      <h2 id="spectator-heading">観戦者</h2>
+      <ul id="spectator-list"></ul>
+      <div class="role-switch">
+        <button id="switch-role" class="btn btn-small" type="button"></button>
+        <p id="role-hint" class="hint"></p>
+      </div>
     </aside>
 
     <main class="stage">
+      <p id="watch-banner" class="watch-banner" hidden></p>
       <p id="notice" class="notice" hidden></p>
 
       <section id="phase-lobby" class="phase" hidden>
@@ -70,21 +89,28 @@
         <div class="card">
           <h2>ゲーム設定</h2>
           <div class="settings">
+            <label for="setting-mode">ゲームモード</label>
+            <select id="setting-mode">
+              <option value="normal">うろドロ（通常）</option>
+              <option value="minna">みんなでうろドロ</option>
+            </select>
             <label for="setting-topic-time">お題入力時間</label>
-            <select id="setting-topic-time" data-key="topicTimeSec" data-unit="秒"></select>
+            <select id="setting-topic-time" class="setting-number" data-key="topicTimeSec" data-unit="秒"></select>
             <label for="setting-draw-time">お絵描き時間</label>
-            <select id="setting-draw-time" data-key="drawTimeSec" data-unit="秒"></select>
-            <label for="setting-parents">1周あたりの親の人数</label>
-            <select id="setting-parents" data-key="parentsPerLap" data-unit="人"></select>
-            <label for="setting-laps">周回数</label>
-            <select id="setting-laps" data-key="laps" data-unit="周"></select>
+            <select id="setting-draw-time" class="setting-number" data-key="drawTimeSec" data-unit="秒"></select>
+            <label for="setting-parents" data-mode="normal">1周あたりの親の人数</label>
+            <select id="setting-parents" class="setting-number" data-key="parentsPerLap" data-unit="人" data-mode="normal"></select>
+            <label for="setting-laps" data-mode="normal">周回数</label>
+            <select id="setting-laps" class="setting-number" data-key="laps" data-unit="周" data-mode="normal"></select>
           </div>
+          <p id="mode-description" class="hint"></p>
           <p id="settings-hint" class="hint"></p>
         </div>
         <button id="start-game" class="btn btn-primary btn-large" hidden>ゲーム開始</button>
         <p id="lobby-wait" class="hint"></p>
       </section>
 
+      <!-- 通常モード：お題入力（親だけ） -->
       <section id="phase-topic" class="phase" hidden>
         <form id="topic-form" class="card" hidden>
           <h2>あなたは親です</h2>
@@ -98,9 +124,24 @@
         <p id="topic-wait" class="big-message" hidden></p>
       </section>
 
+      <!-- みんなでうろドロ：お題入力（全員） -->
+      <section id="phase-mtopic" class="phase" hidden>
+        <form id="mtopic-form" class="card" hidden>
+          <h2>お題を1つ出してください</h2>
+          <label for="mtopic-input">ほかのみんながこのお題を描きます</label>
+          <div class="row">
+            <input id="mtopic-input" type="text" autocomplete="off">
+            <button class="btn btn-primary" type="submit">決定</button>
+          </div>
+          <p class="hint">時間切れになると、お題がランダムで決まります。</p>
+        </form>
+        <p id="mtopic-wait" class="big-message" hidden></p>
+      </section>
+
+      <!-- お絵描き（両モード共通） -->
       <section id="phase-draw" class="phase" hidden>
-        <p class="topic-banner">お題：<strong id="draw-topic"></strong></p>
-        <p id="draw-topic-auto" class="hint" hidden>親が時間内に決めなかったので、お題はランダムで決まりました。</p>
+        <p id="draw-topic-banner" class="topic-banner">お題：<strong id="draw-topic"></strong></p>
+        <p id="draw-topic-auto" class="hint" hidden>このお題は時間切れのためランダムで決まりました。</p>
         <div id="draw-board" hidden>
           <div class="toolbar">
             <div id="color-palette" class="palette"></div>
@@ -127,6 +168,22 @@
         <div id="result-gallery" class="gallery"></div>
         <button id="next-round" class="btn btn-primary btn-large" hidden>次へ進む</button>
         <p id="result-wait" class="hint"></p>
+      </section>
+
+      <!-- みんなでうろドロ：評価 -->
+      <section id="phase-meval" class="phase" hidden>
+        <p class="topic-banner">お題：<strong id="meval-topic"></strong></p>
+        <p id="meval-title" class="big-message"></p>
+        <p id="meval-info" class="hint"></p>
+        <div id="meval-gallery" class="gallery"></div>
+      </section>
+
+      <!-- みんなでうろドロ：結果発表 -->
+      <section id="phase-mresult" class="phase" hidden>
+        <h2>結果発表</h2>
+        <div id="mresult-list" class="mresult-list"></div>
+        <button id="mresult-next" class="btn btn-primary btn-large" hidden>ロビーへ戻る</button>
+        <p id="mresult-wait" class="hint"></p>
       </section>
     </main>
   </div>

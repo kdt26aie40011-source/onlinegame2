@@ -2,7 +2,7 @@ const path = require('path');
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
-const { RoomManager } = require('./src/rooms');
+const { RoomManager } = require('./src/room');
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -24,6 +24,14 @@ app.get('/api/rooms/:roomId', (req, res) => {
   const room = rooms.get(req.params.roomId);
   if (!room) return res.status(404).json({ error: '部屋が見つかりません' });
   res.json(room.publicInfo());
+});
+
+// 絵の画像。IDは推測できないランダムな文字列で、部屋のゲーム中だけ取得できる
+app.get('/api/rooms/:roomId/drawings/:drawingId.png', (req, res) => {
+  const image = rooms.get(req.params.roomId)?.getImage(req.params.drawingId);
+  if (!image) return res.sendStatus(404);
+  res.set('Cache-Control', 'private, max-age=3600');
+  res.type('png').send(image);
 });
 
 app.get('/r/:roomId', (req, res) => {
@@ -61,7 +69,7 @@ io.on('connection', (socket) => {
     });
   };
 
-  enter('join', (room, { name, icon }) => room.join(socket, name, icon));
+  enter('join', (room, { name, icon, role }) => room.join(socket, name, icon, role));
   enter('rejoin', (room, { playerId, token }) => room.rejoin(socket, playerId, token));
 
   // 以下はすべて「入室済みのプレイヤー」からの操作
@@ -74,12 +82,13 @@ io.on('connection', (socket) => {
   };
 
   action('settings:update', (room, pid, settings) => room.updateSettings(pid, settings));
+  action('role:switch', (room, pid, { role }) => room.switchRole(pid, role));
   action('game:start', (room, pid) => room.startGame(pid));
   action('game:next', (room, pid) => room.next(pid));
-  action('topic:submit', (room, pid, { topic }) => room.submitTopic(pid, topic));
-  action('drawing:submit', (room, pid, { image }) => room.submitDrawing(pid, image));
-  action('winner:select', (room, pid, { drawingId }) => room.selectWinner(pid, drawingId));
-  action('drawing:like', (room, pid, { drawingId }) => room.like(pid, drawingId));
+  action('topic:submit', (room, pid, { topic }) => room.gameAction('submitTopic', pid, topic));
+  action('drawing:submit', (room, pid, { image }) => room.gameAction('submitDrawing', pid, image));
+  action('winner:select', (room, pid, { drawingId }) => room.gameAction('selectWinner', pid, drawingId));
+  action('drawing:rate', (room, pid, { kind, drawingId }) => room.gameAction('rate', pid, kind, drawingId));
   action('host:transfer', (room, pid, { playerId }) => room.transferHost(pid, playerId));
   action('room:close', (room, pid) => room.forceClose(pid));
   action('room:leave', (room, pid) => {

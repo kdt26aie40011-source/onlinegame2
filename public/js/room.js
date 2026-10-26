@@ -4,11 +4,11 @@ const roomId = decodeURIComponent(location.pathname.split('/')[2] || '');
 const socket = io();
 
 let state = null;
+let gameSeq = 0; // ゲームごとに増やす（前のゲームの絵や入力を持ち越さないため）
 let deadline = null; // この端末の時計での締め切り
-let boardRoundKey = null;
+let boardKey = null;
 let submitting = false;
-let galleryKey = null;
-let topicRoundKey = null;
+let topicKey = null;
 let zoomedDrawingId = null;
 
 const board = new DrawingBoard($('canvas'), {
@@ -44,7 +44,7 @@ async function init() {
     showJoinError('前回の席は解放されました。もう一度入室してください');
   }
   renderIconPicker(info.icons);
-  if (info.full) showJoinError('部屋が満員です');
+  renderRolePicker(info);
   $('join-screen').hidden = false;
 }
 
@@ -114,6 +114,20 @@ function updateIconPicker() {
   }
 }
 
+function renderRolePicker(info) {
+  const radios = document.querySelectorAll('input[name="role"]');
+  for (const radio of radios) {
+    const full = info.full[radio.value];
+    radio.disabled = full;
+    $(`role-${radio.value}-note`).textContent = full ? '（満員）' : '';
+  }
+  // 選べるほうを選んでおく
+  const available = [...radios].find((r) => !r.disabled);
+  if (available && document.querySelector('input[name="role"]:checked')?.disabled) available.checked = true;
+  if (!available) showJoinError('部屋が満員です');
+  $('join-ingame').hidden = !info.inGame;
+}
+
 function showJoinError(message) {
   $('join-error').textContent = message;
   $('join-error').hidden = false;
@@ -122,9 +136,10 @@ function showJoinError(message) {
 $('join-form').addEventListener('submit', (e) => {
   e.preventDefault();
   const name = $('name-input').value.trim();
+  const role = document.querySelector('input[name="role"]:checked')?.value;
   const button = $('join-button');
   button.disabled = true;
-  socket.emit('join', { roomId, name, icon: selectedIcon }, (res) => {
+  socket.emit('join', { roomId, name, icon: selectedIcon, role }, (res) => {
     button.disabled = false;
     if (!res.ok) {
       if (res.error === '部屋が見つかりません') return showError(ROOM_NOT_FOUND);
@@ -140,6 +155,7 @@ $('join-form').addEventListener('submit', (e) => {
 
 socket.on('state', (next) => {
   if (!inRoom) return;
+  if (next.game && !state?.game) gameSeq++;
   state = next;
   deadline = next.remainingMs != null ? Date.now() + next.remainingMs : null;
   render();
@@ -182,11 +198,12 @@ function showError(message) {
   $('error-screen').hidden = false;
 }
 
-// ---- 退出・部屋の終了 ----
+// ---- 退出・部屋の終了・ホスト譲渡 ----
 
 $('leave-room').addEventListener('click', async () => {
   if (!(await confirmDialog('退出しますか？\n2分以内なら同じ席に戻れます。'))) return;
   inRoom = false;
+  state = null;
   await emitAsync('room:leave');
   $('game-screen').hidden = true;
   $('zoom').hidden = true;
@@ -230,6 +247,19 @@ function confirmDialog(message) {
   });
 }
 
+// ---- 状態の読み取り ----
+
+const me = () => state.players.find((p) => p.id === state.me);
+const isHost = () => state.hostId === state.me;
+const isPlaying = () => !!state.game?.isParticipant; // このゲームで遊んでいる（観戦モードではない）
+const isParent = () => state.game?.parentId === state.me;
+const isChild = () => !!state.game?.childIds?.includes(state.me);
+const isConnected = (playerId) => !!state.players.find((p) => p.id === playerId)?.connected;
+
+function nameOf(playerId, fallback = '（退出した人）') {
+  return state.players.find((p) => p.id === playerId)?.name ?? fallback;
+}
+
 // ---- 描画 ----
 
 const PHASE_SECTION = {
@@ -239,64 +269,106 @@ const PHASE_SECTION = {
   collect: 'phase-draw',
   select: 'phase-select',
   result: 'phase-result',
+  mtopic: 'phase-mtopic',
+  mdraw: 'phase-draw',
+  mcollect: 'phase-draw',
+  mlike: 'phase-meval',
+  munique: 'phase-meval',
+  mresult: 'phase-mresult',
+};
+
+const RENDERERS = {
+  lobby: renderLobby,
+  topic: renderTopic,
+  draw: renderDraw,
+  collect: renderDraw,
+  select: renderSelect,
+  result: renderResult,
+  mtopic: renderMinnaTopic,
+  mdraw: renderDraw,
+  mcollect: renderDraw,
+  mlike: renderEvaluation,
+  munique: renderEvaluation,
+  mresult: renderMinnaResult,
 };
 
 function render() {
-  const s = state;
-  const g = s.game;
-
   renderPlayers();
+  renderWatchBanner();
   $('close-room').hidden = !isHost();
-  $('round-info').textContent = g ? `${g.lap}周目　ラウンド ${g.round} / ${g.roundsPerLap}` : '';
-  $('notice').textContent = s.notice || '';
-  $('notice').hidden = !s.notice;
+  $('round-info').textContent = roundInfo();
+  $('notice').textContent = state.notice || '';
+  $('notice').hidden = !state.notice;
 
-  for (const id of new Set(Object.values(PHASE_SECTION))) $(id).hidden = id !== PHASE_SECTION[s.phase];
+  for (const id of new Set(Object.values(PHASE_SECTION))) $(id).hidden = id !== PHASE_SECTION[state.phase];
+  RENDERERS[state.phase]();
 
-  if (s.phase === 'lobby') renderLobby();
-  if (s.phase === 'topic') renderTopic();
-  if (s.phase === 'draw' || s.phase === 'collect') renderDraw();
-  if (s.phase === 'select') renderSelect();
-  if (s.phase === 'result') renderResult();
-  if (s.phase !== 'select' && s.phase !== 'result') closeZoom();
+  const zoomable = ['select', 'result', 'mlike', 'munique', 'mresult'];
+  if (!zoomable.includes(state.phase)) closeZoom();
   updateTimer();
 }
 
-function renderPlayers() {
-  const list = $('player-list');
-  list.replaceChildren();
-  for (const p of state.players) {
-    const li = document.createElement('li');
-    const icon = document.createElement('span');
-    icon.className = 'player-icon';
-    icon.textContent = p.icon;
-    const name = document.createElement('span');
-    name.className = 'player-name';
-    name.textContent = p.name;
-    li.append(icon, name);
-    li.classList.toggle('away', !p.connected);
-    if (p.id === state.hostId) li.append(badge('👑', 'ホスト'));
-    if (p.id === state.pendingHostId) li.append(badge('次のホスト', '次のラウンドからホスト', 'badge-wait'));
-    if (state.game && p.id === state.game.parentId) li.append(badge('親', '今回の親', 'badge-parent'));
-    if (p.id === state.me) li.append(badge('あなた', null, 'badge-me'));
-    if (!p.connected) li.append(badge('離席中', null, 'badge-away'));
-    if (state.game && !p.inGame) li.append(badge('次のゲームから', null, 'badge-wait'));
-    if (isHost() && p.id !== state.me && p.connected && p.id !== state.pendingHostId) {
-      const give = document.createElement('button');
-      give.type = 'button';
-      give.className = 'btn btn-small btn-give';
-      give.textContent = '👑を譲る';
-      give.addEventListener('click', () => transferHost(p));
-      li.append(give);
-    }
-
-    const stats = document.createElement('span');
-    stats.className = 'player-stats';
-    stats.textContent = `🏆${p.stats.wins}　❤${p.stats.likes}`;
-    stats.title = `1位 ${p.stats.wins}回・いいね ${p.stats.likes}`;
-    li.append(stats);
-    list.append(li);
+function roundInfo() {
+  const g = state.game;
+  if (!g) return '';
+  if (g.mode === 'normal') return `${g.lap}周目　ラウンド ${g.round} / ${g.roundsPerLap}`;
+  switch (state.phase) {
+    case 'mtopic': return 'みんなでうろドロ　お題入力';
+    case 'mdraw':
+    case 'mcollect': return `お絵描き　ラウンド ${g.round} / ${g.totalRounds}`;
+    case 'mlike':
+    case 'munique': return `評価　お題 ${g.evaluation.index} / ${g.evaluation.total}`;
+    default: return 'みんなでうろドロ　結果発表';
   }
+}
+
+function renderPlayers() {
+  const players = $('player-list');
+  const spectators = $('spectator-list');
+  players.replaceChildren();
+  spectators.replaceChildren();
+  for (const p of state.players) {
+    (p.role === 'player' ? players : spectators).append(playerItem(p));
+  }
+  $('spectator-heading').hidden = spectators.childElementCount === 0;
+  renderRoleSwitch();
+}
+
+function playerItem(p) {
+  const g = state.game;
+  const li = document.createElement('li');
+  li.classList.toggle('away', !p.connected);
+  const icon = document.createElement('span');
+  icon.className = 'player-icon';
+  icon.textContent = p.icon;
+  const name = document.createElement('span');
+  name.className = 'player-name';
+  name.textContent = p.name;
+  li.append(icon, name);
+
+  if (p.id === state.hostId) li.append(badge('👑', 'ホスト'));
+  if (p.id === state.pendingHostId) li.append(badge('次のホスト', '次のラウンドからホスト', 'badge-wait'));
+  if (g && p.id === g.parentId) li.append(badge('親', '今回の親', 'badge-parent'));
+  if (p.id === state.me) li.append(badge('あなた', null, 'badge-me'));
+  if (!p.connected) li.append(badge('離席中', null, 'badge-away'));
+  if (g && p.role === 'player' && !g.participantIds.includes(p.id)) li.append(badge('次のゲームから', null, 'badge-wait'));
+  if (p.pendingRole) li.append(badge(p.pendingRole === 'player' ? '次から参加' : '次から観戦', null, 'badge-wait'));
+
+  if (isHost() && p.id !== state.me && p.connected && p.id !== state.pendingHostId) {
+    const give = document.createElement('button');
+    give.type = 'button';
+    give.className = 'btn btn-small btn-give';
+    give.textContent = '👑を譲る';
+    give.addEventListener('click', () => transferHost(p));
+    li.append(give);
+  }
+
+  const stats = document.createElement('span');
+  stats.className = 'player-stats';
+  stats.textContent = `🏆${p.stats.wins}　❤${p.stats.likes}　✨${p.stats.uniques}`;
+  stats.title = `1位 ${p.stats.wins}回・いいね ${p.stats.likes}・ユニーク ${p.stats.uniques}`;
+  li.append(stats);
+  return li;
 }
 
 function badge(text, title, className = '') {
@@ -307,33 +379,70 @@ function badge(text, title, className = '') {
   return span;
 }
 
-function nameOf(playerId, fallback = '（退出した人）') {
-  return state.players.find((p) => p.id === playerId)?.name ?? fallback;
+function renderRoleSwitch() {
+  const self = me();
+  const button = $('switch-role');
+  const target = self.pendingRole ? self.role : (self.role === 'player' ? 'spectator' : 'player');
+  button.dataset.role = target;
+  if (self.pendingRole) {
+    button.textContent = '切り替えを取り消す';
+    $('role-hint').textContent = `次のゲームから${self.pendingRole === 'player' ? '参加者' : '観戦者'}になります。`;
+  } else {
+    button.textContent = target === 'player' ? '🎨 参加者になる' : '👀 観戦者になる';
+    $('role-hint').textContent = state.game ? 'ゲーム中に切り替えると、次のゲームから反映されます。' : '';
+  }
 }
 
-const isHost = () => state.hostId === state.me;
-const isParent = () => state.game?.parentId === state.me;
-const isChild = () => !!state.game?.childIds.includes(state.me);
-const roundKey = () => `${state.game.lap}-${state.game.round}`;
+$('switch-role').addEventListener('click', (e) => {
+  emitAction('role:switch', { role: e.currentTarget.dataset.role });
+});
+
+function renderWatchBanner() {
+  const banner = $('watch-banner');
+  if (!state.game || isPlaying()) {
+    banner.hidden = true;
+    return;
+  }
+  banner.textContent = me().role === 'player'
+    ? '👀 観戦中です。次のゲームから参加できます（観戦中は見るだけです）'
+    : '👀 観戦中です（見るだけです）';
+  banner.hidden = false;
+}
+
+// ---- ロビー ----
+
+const MODE_DESCRIPTIONS = {
+  normal: '親がお題を出し、子が記憶だけで描き、親が1位を選びます。',
+  minna: '全員がお題を出し、ほかの人のお題をすべて描き、みんなで「いいね」と「ユニーク」を付けます。',
+};
 
 function renderLobby() {
+  const { mode } = state.settings;
+  const min = state.limits.minPlayers[mode];
+  const count = state.players.filter((p) => p.role === 'player').length;
+  const enough = count >= min;
+
   $('room-url').value = `${location.origin}/r/${state.roomId}`;
-  const enough = state.players.length >= 2;
   $('start-game').hidden = !isHost();
   $('start-game').disabled = !enough;
   if (isHost()) {
-    $('lobby-wait').textContent = enough ? '準備ができたら「ゲーム開始」を押してください。' : '2人以上集まると開始できます。';
+    $('lobby-wait').textContent = enough
+      ? '準備ができたら「ゲーム開始」を押してください。'
+      : `参加者が${min}人以上集まると開始できます（今 ${count}人）。`;
   } else {
     $('lobby-wait').textContent = `ホスト（${nameOf(state.hostId)}）がゲームを始めるのを待っています…`;
   }
   renderSettings();
 }
 
-const SETTING_SELECTS = ['setting-topic-time', 'setting-draw-time', 'setting-parents', 'setting-laps'];
-
 function renderSettings() {
-  for (const id of SETTING_SELECTS) {
-    const select = $(id);
+  const { mode } = state.settings;
+  $('setting-mode').value = mode;
+  $('setting-mode').disabled = !isHost();
+  for (const el of document.querySelectorAll('.settings [data-mode]')) el.hidden = el.dataset.mode !== mode;
+  $('mode-description').textContent = MODE_DESCRIPTIONS[mode];
+
+  for (const select of document.querySelectorAll('.setting-number')) {
     const { key, unit } = select.dataset;
     const rule = state.settingRules[key];
     const options = [];
@@ -353,56 +462,113 @@ function renderSettings() {
   $('settings-hint').textContent = isHost() ? '' : '設定を変更できるのはホストだけです。';
 }
 
-for (const id of SETTING_SELECTS) {
-  $(id).addEventListener('change', (e) => {
+$('setting-mode').addEventListener('change', (e) => emitAction('settings:update', { mode: e.target.value }));
+for (const select of document.querySelectorAll('.setting-number')) {
+  select.addEventListener('change', (e) => {
     const { key } = e.target.dataset;
     const value = e.target.value === 'all' ? null : Number(e.target.value);
     emitAction('settings:update', { [key]: value });
   });
 }
 
+// ---- 通常モード：お題入力 ----
+
 function renderTopic() {
+  const g = state.game;
   const parent = isParent();
   $('topic-form').hidden = !parent;
   $('topic-wait').hidden = parent;
   if (parent) {
-    if (topicRoundKey !== roundKey()) {
-      topicRoundKey = roundKey();
-      $('topic-input').value = '';
-      $('topic-input').maxLength = state.limits.topicMax;
-      $('topic-input').focus();
-    }
+    resetTopicInput($('topic-input'), `${gameSeq}-${g.lap}-${g.round}-${g.parentId}`);
   } else {
-    $('topic-wait').textContent = `${nameOf(state.game.parentId)}さんがお題を考えています…`;
+    $('topic-wait').textContent = `${nameOf(g.parentId)}さんがお題を考えています…`;
   }
 }
 
-function renderDraw() {
-  const g = state.game;
-  $('draw-topic').textContent = g.topic;
-  $('draw-topic-auto').hidden = !g.topicAuto;
+function resetTopicInput(input, key) {
+  if (topicKey === key) return;
+  topicKey = key;
+  input.value = '';
+  input.maxLength = state.limits.topicMax;
+  input.focus();
+}
 
-  const drawing = isChild() && !g.submitted;
-  if (drawing && boardRoundKey !== roundKey()) {
-    boardRoundKey = roundKey();
+$('topic-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  emitAction('topic:submit', { topic: $('topic-input').value });
+});
+
+// ---- みんなでうろドロ：お題入力 ----
+
+function renderMinnaTopic() {
+  const g = state.game;
+  const canSubmit = isPlaying() && !g.myTopic;
+  $('mtopic-form').hidden = !canSubmit;
+  $('mtopic-wait').hidden = canSubmit;
+  const progress = `（${g.submittedCount} / ${g.submitTotal}人）`;
+  if (canSubmit) {
+    resetTopicInput($('mtopic-input'), `${gameSeq}-mtopic`);
+  } else if (g.myTopic) {
+    $('mtopic-wait').textContent = `お題「${g.myTopic}」を出しました。ほかの人を待っています${progress}`;
+  } else {
+    $('mtopic-wait').textContent = `みんながお題を考えています${progress}`;
+  }
+}
+
+$('mtopic-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  emitAction('topic:submit', { topic: $('mtopic-input').value });
+});
+
+// ---- お絵描き（両モード共通） ----
+
+// 自分の描く状況をモードに関係なく同じ形にそろえる
+function drawContext() {
+  const g = state.game;
+  if (g.mode === 'normal') {
+    return {
+      key: `${gameSeq}-${g.lap}-${g.round}`,
+      topic: g.topic,
+      auto: g.topicAuto,
+      amDrawer: isChild(),
+      submitted: g.submitted,
+      progress: `（提出 ${g.submittedCount} / ${g.childIds.length}）`,
+      waiting: isParent() ? '子がお題を描いています。お楽しみに！' : '子がお題を描いています',
+    };
+  }
+  return {
+    key: `${gameSeq}-m-${g.round}`,
+    topic: g.assignment?.topic ?? null,
+    auto: !!g.assignment?.auto,
+    amDrawer: !!g.assignment,
+    submitted: g.submitted,
+    progress: `（提出 ${g.submittedCount} / ${g.submitTotal}）`,
+    waiting: 'みんながそれぞれ違うお題を描いています',
+  };
+}
+
+function renderDraw() {
+  const ctx = drawContext();
+  const collecting = state.phase === 'collect' || state.phase === 'mcollect';
+  $('draw-topic-banner').hidden = !ctx.topic;
+  $('draw-topic').textContent = ctx.topic ?? '';
+  $('draw-topic-auto').hidden = !ctx.auto;
+
+  const drawing = ctx.amDrawer && !ctx.submitted;
+  if (drawing && boardKey !== ctx.key) {
+    boardKey = ctx.key;
     board.reset();
   }
-  board.setEnabled(drawing && state.phase === 'draw' && !submitting);
-  $('submit-drawing').disabled = state.phase !== 'draw' || submitting;
+  board.setEnabled(drawing && !collecting && !submitting);
+  $('submit-drawing').disabled = collecting || submitting;
   $('draw-board').hidden = !drawing;
   $('draw-wait').hidden = drawing;
-
-  const progress = `（提出 ${g.submittedCount} / ${g.childIds.length}）`;
-  if (isChild()) {
-    $('draw-wait').textContent = `提出しました！ほかの人を待っています${progress}`;
-  } else if (isParent()) {
-    $('draw-wait').textContent = `子がお題を描いています。お楽しみに！${progress}`;
-  } else {
-    $('draw-wait').textContent = `子がお題を描いています${progress}`;
-  }
+  $('draw-wait').textContent = ctx.amDrawer
+    ? `提出しました！ほかの人を待っています${ctx.progress}`
+    : `${ctx.waiting}${ctx.progress}`;
 
   // 時間切れ：描きかけの絵をそのまま提出する
-  if (state.phase === 'collect' && drawing && !submitting) submitDrawing();
+  if (collecting && drawing && !submitting) submitDrawing();
 }
 
 function submitDrawing() {
@@ -412,20 +578,25 @@ function submitDrawing() {
   socket.emit('drawing:submit', { image: board.toDataURL() }, (res) => {
     submitting = false;
     if (!res.ok) showToast(res.error);
-    if (state) render();
+    if (state && inRoom) render();
   });
 }
+
+$('submit-drawing').addEventListener('click', () => {
+  if (!submitting) submitDrawing();
+});
+
+// ---- 通常モード：1位選定・結果発表 ----
 
 function renderSelect() {
   const g = state.game;
   $('select-topic').textContent = g.topic;
-  const parentAway = !state.players.find((p) => p.id === g.parentId)?.connected;
   $('select-info').textContent = isParent()
     ? '1位にしたい絵をタップして選んでください'
-    : parentAway
+    : !isConnected(g.parentId)
       ? `${nameOf(g.parentId)}さんが離席中です。時間内に戻れば選べます…`
       : `${nameOf(g.parentId)}さんが1位を選んでいます…`;
-  renderGallery($('select-gallery'), false);
+  renderGallery($('select-gallery'), { reveal: false });
 }
 
 function renderResult() {
@@ -433,7 +604,7 @@ function renderResult() {
   $('result-topic').textContent = g.topic;
   const winner = g.drawings.find((d) => d.id === g.winnerDrawingId);
   $('result-message').textContent = winner ? `🏆 1位は ${winner.authorName}さん！` : (g.message || '今回は1位なしです');
-  renderGallery($('result-gallery'), true);
+  renderGallery($('result-gallery'), { reveal: true });
 
   const last = g.lap >= g.laps && g.round >= g.roundsPerLap;
   $('next-round').hidden = !isHost();
@@ -441,76 +612,183 @@ function renderResult() {
   $('result-wait').textContent = isHost() ? '' : `ホスト（${nameOf(state.hostId)}）が次へ進むのを待っています…`;
 }
 
-const likeButtons = new Map(); // drawingId -> button
+$('next-round').addEventListener('click', () => emitAction('game:next'));
 
-function renderGallery(container, reveal) {
-  const g = state.game;
-  const key = `${state.phase}:${roundKey()}:${g.drawings.map((d) => d.id).join(',')}`;
-  if (galleryKey !== key || container.childElementCount !== g.drawings.length) {
-    galleryKey = key;
-    buildGallery(container, reveal);
+// ---- ギャラリー（絵の一覧） ----
+
+// 同じ絵の並びなら作り直さず、ボタンの表示だけ更新する
+const galleries = new Map(); // container -> { key, buttons: Map(drawingId -> button) }
+
+function syncGallery(container, key, drawings, buildCard) {
+  let gallery = galleries.get(container);
+  if (gallery?.key !== key) {
+    gallery = { key, buttons: new Map() };
+    galleries.set(container, gallery);
+    container.replaceChildren(...drawings.map((d) => buildCard(d, gallery.buttons)));
   }
-  if (reveal) updateLikeButtons();
+  return gallery.buttons;
 }
 
-function buildGallery(container, reveal) {
-  const g = state.game;
-  likeButtons.clear();
-  container.replaceChildren();
-  for (const d of g.drawings) {
-    const card = document.createElement('div');
-    card.className = 'drawing-card';
-    if (reveal && d.id === g.winnerDrawingId) card.classList.add('winner');
+function drawingCard(d, { caption, winner = false, button = null }) {
+  const card = document.createElement('div');
+  card.className = 'drawing-card';
+  card.classList.toggle('winner', winner);
 
-    const thumb = document.createElement('button');
-    thumb.type = 'button';
-    thumb.className = 'drawing-thumb';
-    thumb.addEventListener('click', () => openZoom(d));
-    const img = document.createElement('img');
-    img.src = d.image;
-    img.alt = reveal ? `${d.authorName}さんの絵` : '子の絵';
-    thumb.append(img);
-    card.append(thumb);
+  const thumb = document.createElement('button');
+  thumb.type = 'button';
+  thumb.className = 'drawing-thumb';
+  thumb.addEventListener('click', () => openZoom(d));
+  const img = document.createElement('img');
+  img.src = d.url;
+  img.alt = d.authorName ? `${d.authorName}さんの絵` : 'みんなの絵';
+  img.loading = 'lazy';
+  thumb.append(img);
+  card.append(thumb);
 
-    if (reveal) {
-      const footer = document.createElement('div');
-      footer.className = 'drawing-footer';
-      const caption = document.createElement('span');
-      caption.className = 'drawing-author';
-      caption.textContent = (d.id === g.winnerDrawingId ? '🏆 ' : '') + d.authorName;
-      const like = document.createElement('button');
-      like.type = 'button';
-      like.className = 'like-button';
-      like.addEventListener('click', () => emitAction('drawing:like', { drawingId: d.id }));
-      likeButtons.set(d.id, like);
-      footer.append(caption, like);
-      card.append(footer);
+  if (caption || button) {
+    const footer = document.createElement('div');
+    footer.className = 'drawing-footer';
+    if (caption) {
+      const text = document.createElement('span');
+      text.className = 'drawing-author';
+      text.textContent = caption;
+      footer.append(text);
     }
-    container.append(card);
+    if (button) footer.append(button);
+    card.append(footer);
   }
+  return card;
 }
 
-function updateLikeButtons() {
-  const me = state.players.find((p) => p.id === state.me);
-  const canLike = !!me?.inGame;
-  for (const d of state.game.drawings) {
-    const button = likeButtons.get(d.id);
-    if (!button) continue;
+function rateButton(onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'like-button';
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function renderGallery(container, { reveal }) {
+  const g = state.game;
+  const key = `${gameSeq}:${state.phase}:${g.drawings.map((d) => d.id).join(',')}`;
+  const buttons = syncGallery(container, key, g.drawings, (d, map) => {
+    if (!reveal) return drawingCard(d, {});
+    const like = rateButton(() => emitAction('drawing:rate', { kind: 'like', drawingId: d.id }));
+    map.set(d.id, like);
+    const winner = d.id === g.winnerDrawingId;
+    return drawingCard(d, { caption: (winner ? '🏆 ' : '') + d.authorName, winner, button: like });
+  });
+
+  if (!reveal) return;
+  for (const d of g.drawings) {
+    const button = buttons.get(d.id);
     const mine = d.authorId === state.me;
     button.textContent = `${d.likedByMe ? '❤' : '♡'} ${d.likeCount}`;
     button.classList.toggle('liked', d.likedByMe);
-    button.disabled = mine || d.likedByMe || !canLike;
+    button.disabled = mine || d.likedByMe || !isPlaying();
     button.title = mine ? '自分の絵にはいいねできません'
       : d.likedByMe ? 'いいねしました'
-        : canLike ? 'いいね' : '観戦中はいいねできません';
+        : isPlaying() ? 'いいね' : '観戦中はいいねできません';
   }
 }
+
+// ---- みんなでうろドロ：評価 ----
+
+const RATE_LABELS = {
+  like: { mark: '❤', empty: '♡', name: 'いいね', guide: '上手！好き！と思った絵' },
+  unique: { mark: '✨', empty: '☆', name: 'ユニーク', guide: '個性的！おもしろい！と思った絵' },
+};
+
+function renderEvaluation() {
+  const ev = state.game.evaluation;
+  const label = RATE_LABELS[ev.kind];
+  $('meval-topic').textContent = ev.topic;
+  $('meval-title').textContent = `${label.mark} ${label.name}タイム：${label.guide}を最大${ev.limit}枚`;
+  if (!isPlaying()) {
+    $('meval-info').textContent = '観戦中は評価できません。';
+  } else {
+    const mine = ev.isMyTopic ? 'あなたが出したお題です。全員の絵を評価できます。' : '';
+    $('meval-info').textContent = `選んだ数 ${ev.used} / ${ev.limit}　${mine}`;
+  }
+
+  const key = `${gameSeq}:${state.phase}:${ev.index}`;
+  const buttons = syncGallery($('meval-gallery'), key, ev.drawings, (d, map) => {
+    const button = rateButton(() => emitAction('drawing:rate', { kind: ev.kind, drawingId: d.id }));
+    map.set(d.id, button);
+    return drawingCard(d, { button });
+  });
+
+  for (const d of ev.drawings) {
+    const button = buttons.get(d.id);
+    button.classList.toggle('liked', d.marked);
+    if (d.mine) {
+      button.textContent = 'あなたの絵';
+      button.disabled = true;
+    } else {
+      button.textContent = d.marked ? `${label.mark} 付けた` : `${label.empty} 付ける`;
+      button.disabled = !isPlaying() || (!d.marked && ev.used >= ev.limit);
+    }
+  }
+}
+
+// ---- みんなでうろドロ：結果発表 ----
+
+function renderMinnaResult() {
+  const { results } = state.game;
+  const key = `${gameSeq}:mresult`;
+  syncGallery($('mresult-list'), key, results, (topic) => topicResult(topic));
+
+  $('mresult-next').hidden = !isHost();
+  $('mresult-wait').textContent = isHost() ? '' : `ホスト（${nameOf(state.hostId)}）がロビーへ戻るのを待っています…`;
+}
+
+function topicResult(topic) {
+  const section = document.createElement('section');
+  section.className = 'card topic-result';
+  const title = document.createElement('h3');
+  title.textContent = `お題：${topic.text}`;
+  const owner = document.createElement('p');
+  owner.className = 'hint';
+  owner.textContent = `出した人：${topic.ownerName}${topic.auto ? '（時間切れのためランダム）' : ''}`;
+  section.append(title, owner);
+
+  if (topic.likeRanking.length === 0) {
+    const empty = document.createElement('p');
+    empty.textContent = 'このお題の絵はありませんでした。';
+    section.append(empty);
+    return section;
+  }
+  section.append(
+    ranking('❤ いいね順位', topic.likeRanking, '❤'),
+    ranking('✨ ユニーク順位', topic.uniqueRanking, '✨'),
+  );
+  return section;
+}
+
+function ranking(heading, entries, mark) {
+  const wrap = document.createElement('div');
+  const h = document.createElement('h4');
+  h.textContent = heading;
+  const gallery = document.createElement('div');
+  gallery.className = 'gallery gallery-small';
+  for (const entry of entries) {
+    const card = drawingCard(entry, {
+      caption: `${entry.rank}位 ${entry.authorName}　${mark}${entry.score}`,
+      winner: entry.rank === 1 && entry.score > 0,
+    });
+    gallery.append(card);
+  }
+  wrap.append(h, gallery);
+  return wrap;
+}
+
+$('mresult-next').addEventListener('click', () => emitAction('game:next'));
 
 // ---- 拡大表示 ----
 
 function openZoom(drawing) {
   zoomedDrawingId = drawing.id;
-  $('zoom-image').src = drawing.image;
+  $('zoom-image').src = drawing.url;
   $('zoom-caption').textContent = drawing.authorName ? `${drawing.authorName}さんの絵` : '';
   $('zoom-select').hidden = !(state.phase === 'select' && isParent());
   $('zoom').hidden = false;
@@ -540,14 +818,6 @@ function emitAction(event, payload = {}) {
 }
 
 $('start-game').addEventListener('click', () => emitAction('game:start'));
-$('next-round').addEventListener('click', () => emitAction('game:next'));
-$('submit-drawing').addEventListener('click', () => {
-  if (!submitting) submitDrawing();
-});
-$('topic-form').addEventListener('submit', (e) => {
-  e.preventDefault();
-  emitAction('topic:submit', { topic: $('topic-input').value });
-});
 
 $('copy-url').addEventListener('click', async () => {
   try {
